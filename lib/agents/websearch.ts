@@ -41,7 +41,10 @@ async function searchTavily(query: string, maxResults: number): Promise<WebResul
 }
 
 async function searchOpenAI(query: string, maxResults: number): Promise<WebResult[]> {
-  const res = await fetch("https://api.openai.com/v1/responses", {
+  // Must follow OPENAI_BASE_URL: when the key belongs to a gateway, posting it
+  // to api.openai.com would hand that key to a third party.
+  const base = (env.OPENAI_BASE_URL ?? "https://api.openai.com/v1").replace(/\/+$/, "");
+  const res = await fetch(`${base}/responses`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",

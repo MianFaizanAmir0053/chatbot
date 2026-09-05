@@ -22,6 +22,34 @@ export const maxDuration = 300;
 
 type Emit = (event: string, data: unknown) => void;
 
+/**
+ * Pull the user-visible text out of a streamed chunk's content.
+ *
+ * `content` arrives either as a plain string or as an array of content blocks.
+ * `createAgent` uses the block form, so matching on `typeof content === "string"`
+ * silently discarded every token: the run completed, tools fired and the
+ * groundedness judge scored an empty string as perfectly grounded, while the
+ * client received no answer at all.
+ *
+ * Only `text` blocks are collected. Reasoning blocks are deliberately excluded —
+ * they are not part of the answer and must not reach the transcript.
+ */
+function visibleText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+
+  let out = "";
+  for (const block of content) {
+    if (typeof block === "string") {
+      out += block;
+      continue;
+    }
+    const { type, text } = (block ?? {}) as { type?: string; text?: unknown };
+    if (type === "text" && typeof text === "string") out += text;
+  }
+  return out;
+}
+
 function sseStream(run: (emit: Emit, signal: AbortSignal) => Promise<void>): Response {
   const encoder = new TextEncoder();
   const controllerRef = new AbortController();
@@ -140,6 +168,15 @@ export async function POST(req: NextRequest) {
 
     let answer = "";
     let lastTodos: unknown[] = [];
+    /**
+     * Final assistant text seen in the node updates.
+     *
+     * Not every OpenAI-compatible endpoint streams token deltas — some return
+     * the completion whole, in which case "messages" mode yields only empty
+     * chunks and the answer appears solely in the update payload. Tracking it
+     * here means the transcript is correct either way.
+     */
+    let bufferedAnswer = "";
 
     const stream = await agent.stream(
       { messages: [new HumanMessage(message)] },
@@ -149,13 +186,17 @@ export async function POST(req: NextRequest) {
     for await (const chunk of stream) {
       const [streamMode, payload] = chunk as [string, unknown];
 
+
       if (streamMode === "messages") {
         // Token-level streaming of the model's visible output.
         const [token] = payload as [{ content?: unknown; getType?: () => string }];
         const type = token?.getType?.();
-        if (type === "ai" && typeof token.content === "string" && token.content) {
-          answer += token.content;
-          emit("token", { text: token.content });
+        if (type === "ai") {
+          const text = visibleText(token.content);
+          if (text) {
+            answer += text;
+            emit("token", { text });
+          }
         }
         continue;
       }
@@ -170,18 +211,55 @@ export async function POST(req: NextRequest) {
           }
 
           const last = update?.messages?.at?.(-1) as
-            | { tool_calls?: Array<{ name: string; args: unknown }>; name?: string }
+            | {
+                tool_calls?: Array<{ name: string; args: unknown }>;
+                name?: string;
+                content?: unknown;
+                getType?: () => string;
+              }
             | undefined;
+
+          // Classify by message type first. `name` is not a tool marker:
+          // createAgent stamps the agent's own name onto its AI messages, so
+          // testing `name` before type reported every assistant turn as a tool
+          // result and dropped the answer on the floor.
+          const type = last?.getType?.();
 
           if (last?.tool_calls?.length) {
             for (const call of last.tool_calls) {
               emit("tool_call", { name: call.name, args: call.args, node });
             }
-          } else if (last?.name) {
-            emit("tool_result", { name: last.name });
+          } else if (type === "tool") {
+            emit("tool_result", { name: last?.name ?? "tool" });
+          } else if (type === "ai") {
+            const text = visibleText(last?.content);
+            if (text) bufferedAnswer = text;
           }
         }
       }
+    }
+
+    // Nothing streamed, but the agent did produce an answer: send it as one
+    // chunk rather than leaving the client with an empty assistant turn.
+    if (!answer && bufferedAnswer) {
+      answer = bufferedAnswer;
+      emit("token", { text: bufferedAnswer });
+    }
+
+    // When every provider refuses, the retry middleware reports the exhaustion
+    // as ordinary message content. Returning that as an answer — or returning
+    // nothing at all — hides an outage behind a blank reply, so raise it.
+    if (!answer.trim() || /^Model call failed after \d+ attempts/.test(answer)) {
+      const detail = answer.trim()
+        ? answer.replace(/\s+/g, " ").slice(0, 300)
+        : "The model returned no output.";
+      console.error(`[chat] no usable answer: ${detail}`);
+      emit("error", {
+        message:
+          "Every configured model provider refused the request — most often a rate limit " +
+          `or an exhausted balance. Details: ${detail}`,
+      });
+      return;
     }
 
     /* --- Output guardrails --- */

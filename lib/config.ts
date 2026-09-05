@@ -15,6 +15,33 @@ const EnvSchema = z.object({
 
   // --- Fallback / auxiliary provider ---
   OPENAI_API_KEY: z.string().optional(),
+  /**
+   * Override for the OpenAI-compatible endpoint.
+   *
+   * Set this to route the OpenAI path — fallback generation, the moderation
+   * middleware and OpenAI web search — through a gateway. Left unset it talks
+   * to api.openai.com. It must be honoured everywhere OPENAI_API_KEY is used,
+   * or a gateway key would be sent to OpenAI itself.
+   */
+  OPENAI_BASE_URL: z.string().optional(),
+
+  // --- Additional OpenAI-compatible gateways, chained for availability ---
+  GROQ_API_KEY: z.string().optional(),
+  GROQ_BASE_URL: z.string().default("https://api.groq.com/openai/v1"),
+
+  BLUESMINDS_API_KEY: z.string().optional(),
+  BLUESMINDS_BASE_URL: z.string().default("https://api.bluesminds.com/v1"),
+
+  BAZAARLINK_API_KEY: z.string().optional(),
+  BAZAARLINK_BASE_URL: z.string().default("https://api.bazaarlink.ai/v1"),
+
+  /**
+   * Comma-separated provider order, best availability first.
+   *
+   * Overrides the built-in order so a provider can be promoted or demoted after
+   * a quota change without editing code.
+   */
+  LLM_PROVIDER_ORDER: z.string().optional(),
 
   // --- Embeddings + reranking ---
   COHERE_API_KEY: z.string().optional(),
@@ -29,6 +56,14 @@ const EnvSchema = z.object({
   AWS_ACCESS_KEY_ID: z.string().optional(),
   AWS_SECRET_ACCESS_KEY: z.string().optional(),
   AWS_S3_BUCKET_NAME: z.string().optional(),
+  /**
+   * Folder inside the bucket that this application owns.
+   *
+   * The bucket is shared with other apps, so every object written here is
+   * scoped to one prefix. That keeps chatbot data from colliding with anything
+   * else and makes a full cleanup a prefix delete rather than a filename hunt.
+   */
+  AWS_S3_PREFIX: z.string().default("chatbot/"),
 
   // --- Web search ---
   TAVILY_API_KEY: z.string().optional(),
@@ -86,6 +121,97 @@ export const COHERE_MODELS = {
   PRO: process.env.COHERE_MODEL_PRO || "command-a-03-2025",
   FAST: process.env.COHERE_MODEL_FAST || "command-r7b-12-2024",
 } as const;
+
+/* ------------------------------------------------------------------ *
+ * Provider registry
+ * ------------------------------------------------------------------ */
+
+export interface LlmProvider {
+  name: string;
+  apiKey: string;
+  baseURL: string;
+  pro: string;
+  fast: string;
+}
+
+/**
+ * Every OpenAI-compatible provider, in default availability order.
+ *
+ * Free and trial keys fail in two ways that look identical to the agent — a
+ * 429 burst limit and a 402 exhausted balance — and a single-provider setup
+ * turns either into a dead chatbot. Declaring them as one ordered list lets the
+ * agent rotate its primary across providers and fall through the rest on
+ * failure, so one exhausted key degrades throughput instead of stopping work.
+ *
+ * Order below reflects measured behaviour: acceptance of a six-call burst
+ * first, then latency. Override it with LLM_PROVIDER_ORDER.
+ */
+const PROVIDER_CATALOGUE: LlmProvider[] = [
+  {
+    name: "groq",
+    apiKey: env.GROQ_API_KEY ?? "",
+    baseURL: env.GROQ_BASE_URL,
+    pro: process.env.GROQ_MODEL_PRO || "openai/gpt-oss-120b",
+    fast: process.env.GROQ_MODEL_FAST || "openai/gpt-oss-20b",
+  },
+  {
+    name: "bluesminds",
+    apiKey: env.BLUESMINDS_API_KEY ?? "",
+    baseURL: env.BLUESMINDS_BASE_URL,
+    pro: process.env.BLUESMINDS_MODEL_PRO || "gpt-5.6-terra",
+    fast: process.env.BLUESMINDS_MODEL_FAST || "gpt-5.6-luna",
+  },
+  {
+    name: "bazaarlink",
+    apiKey: env.BAZAARLINK_API_KEY ?? "",
+    baseURL: env.BAZAARLINK_BASE_URL,
+    pro: process.env.BAZAARLINK_MODEL_PRO || "deepseek-v4-pro",
+    fast: process.env.BAZAARLINK_MODEL_FAST || "deepseek-v4-flash",
+  },
+  {
+    name: "deepseek",
+    apiKey: env.DEEPSEEK_API_KEY ?? "",
+    baseURL: env.DEEPSEEK_BASE_URL,
+    pro: MODEL_TIERS.PRO,
+    fast: MODEL_TIERS.FAST,
+  },
+  {
+    name: "openai",
+    apiKey: env.OPENAI_API_KEY ?? "",
+    baseURL: env.OPENAI_BASE_URL ?? "https://api.openai.com/v1",
+    pro: FALLBACK_MODELS.PRO,
+    fast: FALLBACK_MODELS.FAST,
+  },
+];
+
+/**
+ * Providers that actually have a key, in the configured order.
+ *
+ * Two providers pointed at the same endpoint with the same key would retry an
+ * outage against itself, so duplicates are collapsed.
+ */
+export const LLM_PROVIDERS: LlmProvider[] = (() => {
+  const preferred = env.LLM_PROVIDER_ORDER?.split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+
+  const usable = PROVIDER_CATALOGUE.filter((p) => p.apiKey);
+
+  const ordered = preferred?.length
+    ? [
+        ...preferred.flatMap((name) => usable.filter((p) => p.name === name)),
+        ...usable.filter((p) => !preferred.includes(p.name)),
+      ]
+    : usable;
+
+  const seen = new Set<string>();
+  return ordered.filter((p) => {
+    const identity = `${p.baseURL}|${p.apiKey}`;
+    if (seen.has(identity)) return false;
+    seen.add(identity);
+    return true;
+  });
+})();
 
 export const EMBEDDING_CONFIG = {
   model: "embed-v4.0",
@@ -156,7 +282,14 @@ export const features = {
   qdrant: Boolean(env.QDRANT_URL),
   s3: Boolean(env.AWS_S3_BUCKET_NAME && env.AWS_ACCESS_KEY_ID),
   tavily: Boolean(env.TAVILY_API_KEY),
-  moderation: Boolean(env.OPENAI_API_KEY),
+  /**
+   * Content moderation needs OpenAI's dedicated moderation endpoint
+   * (omni-moderation-latest), which OpenAI-compatible gateways generally do not
+   * serve — they answer /chat/completions and 503 everything else. Enabling it
+   * against a gateway meant every model call carried a guardrail that could only
+   * fail, so it is on only when talking to OpenAI proper.
+   */
+  moderation: Boolean(env.OPENAI_API_KEY) && !env.OPENAI_BASE_URL,
   tracing: env.LANGSMITH_TRACING === "true" && Boolean(env.LANGSMITH_API_KEY),
 } as const;
 
@@ -167,5 +300,5 @@ export const features = {
  * but not `createAgent`. See ModelOptions.allowCohere in models.ts.
  */
 export function hasReasoningProvider(): boolean {
-  return features.deepseek || features.openai;
+  return LLM_PROVIDERS.length > 0;
 }

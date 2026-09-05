@@ -13,7 +13,7 @@ import {
   toolRetryMiddleware,
 } from "langchain";
 import { ChatOpenAI } from "@langchain/openai";
-import { GUARDRAIL_CONFIG, env, features } from "../config";
+import { FALLBACK_MODELS, GUARDRAIL_CONFIG, env, features } from "../config";
 import { getFallbackModels, getModel } from "../models";
 
 /**
@@ -62,8 +62,17 @@ export function buildMiddleware(options: { enableTodos?: boolean } = {}) {
 
   middleware.push(
     modelRetryMiddleware({
-      maxRetries: 3,
+      maxRetries: 4,
       backoffFactor: 2,
+      // Rate limits, not transport blips, are what actually fails these calls:
+      // free and trial tiers meter per minute, so the default sub-second
+      // backoff retries inside the same closed window and exhausts every
+      // attempt without ever waiting long enough to be let back in. Starting
+      // at two seconds spans the window; jitter stops parallel calls in one
+      // agent turn from retrying in lockstep.
+      initialDelayMs: 2_000,
+      maxDelayMs: 30_000,
+      jitter: true,
       onFailure: "continue",
     }),
   );
@@ -130,7 +139,11 @@ export function buildMiddleware(options: { enableTodos?: boolean } = {}) {
       // quota error there must not take down chat entirely.
       resilient(
         openAIModerationMiddleware({
-          model: new ChatOpenAI({ model: "gpt-5.6-luna", apiKey: env.OPENAI_API_KEY }),
+          model: new ChatOpenAI({
+            model: FALLBACK_MODELS.FAST,
+            apiKey: env.OPENAI_API_KEY,
+            ...(env.OPENAI_BASE_URL ? { configuration: { baseURL: env.OPENAI_BASE_URL } } : {}),
+          }),
           checkInput: true,
           checkOutput: true,
           checkToolResults: true,

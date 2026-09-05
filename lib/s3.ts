@@ -29,6 +29,24 @@ export function getS3Client(): S3Client {
 
 export const BUCKET_NAME = env.AWS_S3_BUCKET_NAME ?? "";
 
+/**
+ * Normalise a configured prefix into `folder/` form.
+ *
+ * Accepts `chatbot`, `/chatbot`, `chatbot/` and `chatbot//` alike, because the
+ * value comes from an env file where a stray slash is easy to leave behind and
+ * would otherwise produce keys like `chatbot//uploads/…`.
+ */
+function normalisePrefix(raw: string): string {
+  const trimmed = raw.trim().replace(/^\/+/, "").replace(/\/+$/, "");
+  return trimmed ? `${trimmed}/` : "";
+}
+
+/** Root folder this application owns inside the shared bucket. */
+export const S3_PREFIX = normalisePrefix(env.AWS_S3_PREFIX);
+
+/** Where uploaded source documents live. Every read and write goes through this. */
+export const UPLOAD_PREFIX = `${S3_PREFIX}uploads/`;
+
 function assertConfigured() {
   if (!features.s3) {
     throw new Error(
@@ -58,7 +76,7 @@ export async function uploadFileToS3(
   contentType: string,
 ): Promise<UploadResult> {
   assertConfigured();
-  const key = `uploads/${Date.now()}-${sanitiseFileName(fileName)}`;
+  const key = `${UPLOAD_PREFIX}${Date.now()}-${sanitiseFileName(fileName)}`;
 
   await getS3Client().send(
     new PutObjectCommand({
@@ -105,7 +123,7 @@ export async function deleteFileFromS3(key: string): Promise<void> {
   await getS3Client().send(new DeleteObjectCommand({ Bucket: BUCKET_NAME, Key: key }));
 }
 
-export async function listUploads(prefix = "uploads/") {
+export async function listUploads(prefix: string = UPLOAD_PREFIX) {
   assertConfigured();
   const res = await getS3Client().send(
     new ListObjectsV2Command({ Bucket: BUCKET_NAME, Prefix: prefix, MaxKeys: 100 }),

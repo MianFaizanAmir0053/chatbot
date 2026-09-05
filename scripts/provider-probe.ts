@@ -13,6 +13,8 @@ type Provider = {
   apiKey: string;
   pro: string;
   fast: string;
+  /** Extra headers a gateway requires for attribution or routing. */
+  headers?: Record<string, string>;
 };
 
 const PROVIDERS: Provider[] = [
@@ -29,6 +31,26 @@ const PROVIDERS: Provider[] = [
     apiKey: process.env.BLUESMINDS_API_KEY ?? "",
     pro: "gpt-5.6-terra",
     fast: "gpt-5.6-luna",
+  },
+  {
+    name: "openrouter",
+    baseURL: "https://openrouter.ai/api/v1",
+    apiKey: process.env.OPENROUTER_API_KEY ?? "",
+    pro: "openai/gpt-4o",
+    fast: "openai/gpt-4o-mini",
+    headers: {
+      "HTTP-Referer": process.env.OPENROUTER_SITE_URL ?? "http://localhost:3000",
+      "X-Title": process.env.OPENROUTER_SITE_NAME ?? "Agentic RAG",
+    },
+  },
+  {
+    name: "mistral",
+    baseURL: "https://api.mistral.ai/v1",
+    apiKey: process.env.MISTRAL_API_KEY ?? "",
+    // The free tier rate-limits mistral-small / magistral-small on the first
+    // call; the ministral line answers reliably and still supports tools.
+    pro: "ministral-14b-latest",
+    fast: "ministral-8b-latest",
   },
   {
     name: "bazaarlink",
@@ -64,6 +86,7 @@ async function call(
       headers: {
         Authorization: `Bearer ${p.apiKey}`,
         "Content-Type": "application/json",
+        ...p.headers,
       },
       body: JSON.stringify({
         model,

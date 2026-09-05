@@ -35,6 +35,15 @@ const EnvSchema = z.object({
   BAZAARLINK_API_KEY: z.string().optional(),
   BAZAARLINK_BASE_URL: z.string().default("https://api.bazaarlink.ai/v1"),
 
+  MISTRAL_API_KEY: z.string().optional(),
+  MISTRAL_BASE_URL: z.string().default("https://api.mistral.ai/v1"),
+
+  OPENROUTER_API_KEY: z.string().optional(),
+  OPENROUTER_BASE_URL: z.string().default("https://openrouter.ai/api/v1"),
+  /** Attribution shown on OpenRouter's app leaderboard. */
+  OPENROUTER_SITE_URL: z.string().default("http://localhost:3000"),
+  OPENROUTER_SITE_NAME: z.string().default("Agentic RAG"),
+
   /**
    * Comma-separated provider order, best availability first.
    *
@@ -132,6 +141,8 @@ export interface LlmProvider {
   baseURL: string;
   pro: string;
   fast: string;
+  /** Extra headers the gateway requires, for attribution or routing. */
+  headers?: Record<string, string>;
 }
 
 /**
@@ -160,6 +171,30 @@ const PROVIDER_CATALOGUE: LlmProvider[] = [
     baseURL: env.BLUESMINDS_BASE_URL,
     pro: process.env.BLUESMINDS_MODEL_PRO || "gpt-5.6-terra",
     fast: process.env.BLUESMINDS_MODEL_FAST || "gpt-5.6-luna",
+  },
+  {
+    name: "openrouter",
+    apiKey: env.OPENROUTER_API_KEY ?? "",
+    baseURL: env.OPENROUTER_BASE_URL,
+    pro: process.env.OPENROUTER_MODEL_PRO || "openai/gpt-4o",
+    fast: process.env.OPENROUTER_MODEL_FAST || "openai/gpt-4o-mini",
+    // OpenRouter attributes traffic to a site by these headers and shows it on
+    // the app leaderboard; they are optional but cheap, and requests without
+    // them are treated as anonymous.
+    headers: {
+      "HTTP-Referer": env.OPENROUTER_SITE_URL,
+      "X-Title": env.OPENROUTER_SITE_NAME,
+    },
+  },
+  {
+    name: "mistral",
+    apiKey: env.MISTRAL_API_KEY ?? "",
+    baseURL: env.MISTRAL_BASE_URL,
+    // The ministral line, not mistral-small: the free tier rate-limits the
+    // small and magistral models on the very first call, while these answer
+    // reliably and still support tool calling, which the agent loop requires.
+    pro: process.env.MISTRAL_MODEL_PRO || "ministral-14b-latest",
+    fast: process.env.MISTRAL_MODEL_FAST || "ministral-8b-latest",
   },
   {
     name: "bazaarlink",
@@ -197,11 +232,13 @@ export const LLM_PROVIDERS: LlmProvider[] = (() => {
 
   const usable = PROVIDER_CATALOGUE.filter((p) => p.apiKey);
 
+  // When the order is given it is an allowlist, not just a ranking: a provider
+  // is dropped by removing it from the list, without deleting its key. Appending
+  // the unlisted ones instead would silently keep a known-bad gateway — one that
+  // answers, but slowly enough to consume the whole request budget — as the last
+  // hop, which is the case this setting exists to prevent.
   const ordered = preferred?.length
-    ? [
-        ...preferred.flatMap((name) => usable.filter((p) => p.name === name)),
-        ...usable.filter((p) => !preferred.includes(p.name)),
-      ]
+    ? preferred.flatMap((name) => usable.filter((p) => p.name === name))
     : usable;
 
   const seen = new Set<string>();

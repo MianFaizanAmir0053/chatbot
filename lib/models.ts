@@ -124,13 +124,26 @@ export function getAuxModels(tier: ModelTier = "fast", temperature = 0): BaseCha
   return chain;
 }
 
-/** Instantiate one registry entry. Every provider speaks the OpenAI wire format. */
-function providerModel(provider: LlmProvider, tier: ModelTier, temperature: number): BaseChatModel {
+/**
+ * Instantiate one registry entry. Every provider speaks the OpenAI wire format.
+ *
+ * Exported so a connectivity check can exercise the same construction the agent
+ * uses — a check that rebuilt the client itself could pass while the real base
+ * URL or headers were wrong.
+ */
+export function providerModel(
+  provider: LlmProvider,
+  tier: ModelTier,
+  temperature: number,
+): BaseChatModel {
   return new ChatOpenAI({
     model: tier === "pro" ? provider.pro : provider.fast,
     apiKey: provider.apiKey,
     temperature,
-    configuration: { baseURL: provider.baseURL },
+    configuration: {
+      baseURL: provider.baseURL,
+      ...(provider.headers ? { defaultHeaders: provider.headers } : {}),
+    },
   }) as unknown as BaseChatModel;
 }
 

@@ -39,3 +39,6 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# agent skill symlinks (machine-specific absolute paths; .agents/ holds the real files)
+.claude/skills/

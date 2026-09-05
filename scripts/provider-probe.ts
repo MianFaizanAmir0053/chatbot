@@ -167,3 +167,7 @@ async function main() {
 }
 
 void main();
+
+// Marks the file as a module. Without it TypeScript treats these top-level
+// declarations as globals, which collides with the sibling audit script.
+export {};

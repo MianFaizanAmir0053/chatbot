@@ -71,6 +71,8 @@ type Health = {
       fallbackAvailable?: boolean;
       agentCapable?: boolean;
       note?: string;
+      /** Failover chain, primary first. */
+      chain?: string[];
     };
     retrieval?: {
       embeddings?: string;
@@ -330,6 +332,20 @@ export default function DashboardPage() {
                   <Row label="Fallback">
                     {checks.models?.fallbackAvailable ? "Configured" : "None"}
                   </Row>
+                  {(checks.models?.chain?.length ?? 0) > 0 && (
+                    <div className="flex items-center justify-between gap-3 py-2">
+                      <span className="shrink-0 text-xs text-ink-3">Failover chain</span>
+                      {/* Order is the order tried, so keep it visually sequential. */}
+                      <div className="flex flex-wrap items-center justify-end gap-1">
+                        {checks.models?.chain?.map((name, i) => (
+                          <span key={name} className="flex items-center gap-1">
+                            {i > 0 && <span className="text-[10px] text-ink-3">→</span>}
+                            <Pill tone={i === 0 ? "accent" : "neutral"}>{name}</Pill>
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  )}
                   {checks.models?.note && (
                     <Note tone="warn">{checks.models.note}</Note>
                   )}

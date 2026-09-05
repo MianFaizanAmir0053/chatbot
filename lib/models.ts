@@ -156,10 +156,29 @@ export function getFallbackModels(tier: ModelTier = "pro"): BaseChatModel[] {
   );
 }
 
+/**
+ * Name of the provider actually serving the primary model.
+ *
+ * The primary is configured through the DEEPSEEK_* slot, but that slot can
+ * point at any OpenAI-compatible gateway, so reporting a literal "deepseek"
+ * mislabels the dashboard whenever it does. Resolve it against the registry and
+ * fall back to the endpoint host, which is true by construction.
+ */
+export function activeProviderName(): string {
+  const primary = `${env.DEEPSEEK_BASE_URL}|${env.DEEPSEEK_API_KEY ?? ""}`;
+  const match = LLM_PROVIDERS.find((p) => `${p.baseURL}|${p.apiKey}` === primary);
+  if (match) return match.name;
+  try {
+    return new URL(env.DEEPSEEK_BASE_URL).host.replace(/^api\./, "");
+  } catch {
+    return "deepseek";
+  }
+}
+
 /** Model string identifying the active provider, for logs and telemetry. */
 export function activeModelId(tier: ModelTier = "pro"): string {
   if (features.deepseek) {
-    return `deepseek:${tier === "pro" ? MODEL_TIERS.PRO : MODEL_TIERS.FAST}`;
+    return `${activeProviderName()}:${tier === "pro" ? MODEL_TIERS.PRO : MODEL_TIERS.FAST}`;
   }
   if (features.openai) {
     return `openai:${tier === "pro" ? FALLBACK_MODELS.PRO : FALLBACK_MODELS.FAST}`;

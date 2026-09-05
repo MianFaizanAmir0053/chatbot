@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { activeSearchProvider } from "@/lib/agents/websearch";
-import { MODEL_TIERS, RERANK_CONFIG, env, features } from "@/lib/config";
-import { activeModelId } from "@/lib/models";
+import { LLM_PROVIDERS, MODEL_TIERS, RERANK_CONFIG, env, features } from "@/lib/config";
+import { activeModelId, activeProviderName } from "@/lib/models";
 import { sparseIndexStats } from "@/lib/retrieval/hybrid";
 import { s3Healthy } from "@/lib/s3";
 import { getVectorStore } from "@/lib/vectorstore";
@@ -39,7 +39,13 @@ export async function GET() {
 
   const agentCapable = features.deepseek || features.openai;
   checks.models = {
-    provider: features.deepseek ? "deepseek" : features.openai ? "openai (fallback)" : "none",
+    provider: features.deepseek
+      ? activeProviderName()
+      : features.openai
+        ? "openai (fallback)"
+        : "none",
+    /** Every gateway in the failover chain, primary first. */
+    chain: LLM_PROVIDERS.map((p) => p.name),
     pro: activeModelId("pro"),
     fast: activeModelId("fast"),
     configuredTiers: MODEL_TIERS,
@@ -66,7 +72,11 @@ export async function GET() {
   };
 
   checks.guardrails = {
-    moderation: features.moderation ? "openai" : "disabled (OPENAI_API_KEY missing)",
+    moderation: features.moderation
+      ? "openai"
+      : env.OPENAI_BASE_URL
+        ? "disabled (OPENAI_BASE_URL set — gateways do not serve omni-moderation)"
+        : "disabled (OPENAI_API_KEY missing)",
     piiRedaction: true,
     injectionDetection: true,
     groundednessCheck: true,

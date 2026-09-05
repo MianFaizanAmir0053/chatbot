@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "qdrant-advisor": {
+      "source": "qdrant/skills",
+      "sourceType": "github",
+      "skillPath": "meta/qdrant-advisor/SKILL.md",
+      "computedHash": "3b94c054a28c1a77124b415d5732417d0216c2e216a25f6913aca002d44d36a7"
+    }
+  }
+}

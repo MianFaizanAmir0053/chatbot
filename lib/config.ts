@@ -38,6 +38,24 @@ const EnvSchema = z.object({
   MISTRAL_API_KEY: z.string().optional(),
   MISTRAL_BASE_URL: z.string().default("https://api.mistral.ai/v1"),
 
+  SILICONFLOW_API_KEY: z.string().optional(),
+  SILICONFLOW_BASE_URL: z.string().default("https://api.siliconflow.com/v1"),
+
+  REQUESTY_API_KEY: z.string().optional(),
+  REQUESTY_BASE_URL: z.string().default("https://router.requesty.ai/v1"),
+
+  LLM7_API_KEY: z.string().optional(),
+  LLM7_BASE_URL: z.string().default("https://api.llm7.io/v1"),
+
+  AIONLABS_API_KEY: z.string().optional(),
+  AIONLABS_BASE_URL: z.string().default("https://api.aionlabs.ai/v1"),
+
+  VENICE_API_KEY: z.string().optional(),
+  VENICE_BASE_URL: z.string().default("https://api.venice.ai/api/v1"),
+
+  POLLINATIONS_API_KEY: z.string().optional(),
+  POLLINATIONS_BASE_URL: z.string().default("https://text.pollinations.ai/openai"),
+
   HUGGINGFACE_API_KEY: z.string().optional(),
   HUGGINGFACE_BASE_URL: z.string().default("https://router.huggingface.co/v1"),
 
@@ -229,6 +247,59 @@ const PROVIDER_CATALOGUE: LlmProvider[] = [
     // visible text, so a small max_tokens comes back empty rather than short.
     pro: process.env.GEMINI_MODEL_PRO || "gemini-flash-latest",
     fast: process.env.GEMINI_MODEL_FAST || "gemini-flash-lite-latest",
+  },
+  {
+    name: "aionlabs",
+    apiKey: env.AIONLABS_API_KEY ?? "",
+    baseURL: env.AIONLABS_BASE_URL,
+    // aion-3.0 is the only model from the 2026-09-06 provider trial that
+    // completed a real agent turn. aion-3.0-mini returned tool calls in one
+    // trial and answered without them in another, so it is not used.
+    pro: process.env.AIONLABS_MODEL_PRO || "aion-labs/aion-3.0",
+    fast: process.env.AIONLABS_MODEL_FAST || "aion-labs/aion-3.0",
+  },
+  {
+    name: "siliconflow",
+    apiKey: env.SILICONFLOW_API_KEY ?? "",
+    baseURL: env.SILICONFLOW_BASE_URL,
+    // Answered three trial calls with working tool calls and then returned 402
+    // for the rest — the balance covered exactly those calls. Left out of the
+    // chain until the account is funded; the models themselves are capable.
+    pro: process.env.SILICONFLOW_MODEL_PRO || "deepseek-ai/DeepSeek-V4-Pro",
+    fast: process.env.SILICONFLOW_MODEL_FAST || "zai-org/GLM-5.3-Flash",
+  },
+  {
+    name: "requesty",
+    apiKey: env.REQUESTY_API_KEY ?? "",
+    baseURL: env.REQUESTY_BASE_URL,
+    // Single tool calls succeed and sustain load, but a full agent turn fails
+    // with 400 "enable tool_config.include_server_side_tool_invocations" —
+    // a Requesty-side requirement this client does not send.
+    pro: process.env.REQUESTY_MODEL_PRO || "google/gemma-4-31b-it",
+    fast: process.env.REQUESTY_MODEL_FAST || "google/gemma-4-31b-it",
+  },
+  {
+    name: "llm7",
+    apiKey: env.LLM7_API_KEY ?? "",
+    baseURL: env.LLM7_BASE_URL,
+    // Its Claude and GPT models 402; codestral answers but only 2 of 5 calls
+    // under load, the rest 429 "model is temporarily busy".
+    pro: process.env.LLM7_MODEL_PRO || "codestral-latest",
+    fast: process.env.LLM7_MODEL_FAST || "codestral-latest",
+  },
+  {
+    name: "venice",
+    apiKey: env.VENICE_API_KEY ?? "",
+    baseURL: env.VENICE_BASE_URL,
+    pro: process.env.VENICE_MODEL_PRO || "zai-org-glm-5-2",
+    fast: process.env.VENICE_MODEL_FAST || "z-ai-glm-5-3-flash",
+  },
+  {
+    name: "pollinations",
+    apiKey: env.POLLINATIONS_API_KEY ?? "",
+    baseURL: env.POLLINATIONS_BASE_URL,
+    pro: process.env.POLLINATIONS_MODEL_PRO || "openai-fast",
+    fast: process.env.POLLINATIONS_MODEL_FAST || "openai-fast",
   },
   {
     name: "huggingface",

@@ -21,12 +21,30 @@ if (!provider || !model) {
   process.exit(1);
 }
 
-// Narrow the registry to the single pair under test before any module reads
-// the environment, so the agent cannot quietly fall back to another provider
-// and report its success as this model's.
+// Point the primary slot at the pair under test, before any module reads the
+// environment.
+//
+// Setting LLM_PROVIDER_ORDER alone is not enough and silently tests the wrong
+// thing: the agent's model comes from the DEEPSEEK_* slot, so narrowing the
+// registry left the primary on whatever that slot already held. Four providers
+// once "failed" this check identically for exactly that reason — none of them
+// had been called.
+const upper = provider.toUpperCase();
+const key = process.env[`${upper}_API_KEY`];
+const baseURL = process.env[`${upper}_BASE_URL`];
+
+if (!key || !baseURL) {
+  console.error(`set ${upper}_API_KEY and ${upper}_BASE_URL in .env first`);
+  process.exit(1);
+}
+
 process.env.LLM_PROVIDER_ORDER = provider;
-process.env[`${provider.toUpperCase()}_MODEL_PRO`] = model;
-process.env[`${provider.toUpperCase()}_MODEL_FAST`] = model;
+process.env.DEEPSEEK_API_KEY = key;
+process.env.DEEPSEEK_BASE_URL = baseURL;
+process.env.DEEPSEEK_MODEL_PRO = model;
+process.env.DEEPSEEK_MODEL_FAST = model;
+process.env[`${upper}_MODEL_PRO`] = model;
+process.env[`${upper}_MODEL_FAST`] = model;
 
 async function main() {
   const { HumanMessage } = await import("@langchain/core/messages");

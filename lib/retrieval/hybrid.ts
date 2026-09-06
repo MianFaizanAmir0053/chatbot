@@ -101,36 +101,40 @@ export async function hybridSearch(
   limit: number = RETRIEVAL_CONFIG.FUSION_TOP_K,
 ): Promise<FusedDocument[]> {
   const store = await getVectorStore();
-  const lists: Array<{ name: string; docs: Document[] }> = [];
 
-  const dense = await Promise.all(
-    queries.map(async (q, i) => {
-      try {
-        const hits = await store.similaritySearchWithScore(q, RETRIEVAL_CONFIG.DENSE_TOP_K);
-        return { name: `dense:${i}`, docs: hits.map(([doc]) => doc) };
-      } catch (error) {
-        console.error("[hybrid] dense search failed:", error);
-        return { name: `dense:${i}`, docs: [] as Document[] };
-      }
-    }),
-  );
-  lists.push(...dense);
-
-  const bm25 = await getSparseIndex(RETRIEVAL_CONFIG.SPARSE_TOP_K);
-  if (bm25) {
-    const sparse = await Promise.all(
+  // The two retrievers are independent, so they run together rather than one
+  // after the other. They were sequential, which meant every search paid the
+  // dense path — an embedding call and a Qdrant round trip — before the sparse
+  // path started, and on a first search also the corpus load that builds the
+  // BM25 index. Nothing in either needs the other's result.
+  const [dense, sparse] = await Promise.all([
+    Promise.all(
       queries.map(async (q, i) => {
         try {
-          const docs = await bm25.invoke(q);
-          return { name: `sparse:${i}`, docs: docs as Document[] };
+          const hits = await store.similaritySearchWithScore(q, RETRIEVAL_CONFIG.DENSE_TOP_K);
+          return { name: `dense:${i}`, docs: hits.map(([doc]) => doc) };
         } catch (error) {
-          console.error("[hybrid] sparse search failed:", error);
-          return { name: `sparse:${i}`, docs: [] as Document[] };
+          console.error("[hybrid] dense search failed:", error);
+          return { name: `dense:${i}`, docs: [] as Document[] };
         }
       }),
-    );
-    lists.push(...sparse);
-  }
+    ),
+    (async () => {
+      const bm25 = await getSparseIndex(RETRIEVAL_CONFIG.SPARSE_TOP_K);
+      if (!bm25) return [];
+      return Promise.all(
+        queries.map(async (q, i) => {
+          try {
+            const docs = await bm25.invoke(q);
+            return { name: `sparse:${i}`, docs: docs as Document[] };
+          } catch (error) {
+            console.error("[hybrid] sparse search failed:", error);
+            return { name: `sparse:${i}`, docs: [] as Document[] };
+          }
+        }),
+      );
+    })(),
+  ]);
 
-  return reciprocalRankFusion(lists).slice(0, limit);
+  return reciprocalRankFusion([...dense, ...sparse]).slice(0, limit);
 }

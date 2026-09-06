@@ -127,7 +127,12 @@ export async function retrieve(
     const topK = options.topK ?? profile.FINAL_TOP_K;
 
     const queries = expand ? await planQueries(query, history, profile) : [query];
-    const fused = await hybridSearch(queries);
+    // The profile's fusion width has to be passed: `hybridSearch` defaults to
+    // the global RETRIEVAL_CONFIG value, so omitting it silently pinned every
+    // mode to fifty candidates. Deep mode has been advertising a pool of eighty
+    // and reranking fifty — the extra breadth it exists to buy was configured,
+    // documented, and never reached the reranker.
+    const fused = await hybridSearch(queries, profile.FUSION_TOP_K);
     const ranked = await rerankDocuments(query, fused, topK);
 
     return {

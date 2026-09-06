@@ -30,6 +30,7 @@ import {
   type EvidenceCollector,
 } from "../lib/agents/tools";
 import { subagentProviderNames } from "../lib/models";
+import { normaliseCitations } from "../lib/guardrails/output";
 import { formatContext } from "../lib/retrieval/pipeline";
 import type { RankedDocument } from "../lib/retrieval/rerank";
 
@@ -98,6 +99,41 @@ function citationOrdinals() {
 }
 
 /**
+ * Malformed citation markers must be repaired, not ignored.
+ *
+ * The validator recognises `[n]` and nothing else, so a marker in a different
+ * shape is not caught as invalid — it is not seen. A measured delegating turn
+ * answered with `[1†L1-L3]`, a citation style from another vendor's tooling,
+ * and the pipeline reported "no citations in the answer" while showing that
+ * text to the user. A fabricated number gets stripped; a malformed one used to
+ * sail through every check.
+ */
+function citationRepair() {
+  console.log("\n[citations] malformed markers are repaired");
+
+  const cases: Array<[string, string]> = [
+    ["Receipts under GBP 10 [1†L1-L3] need no itemisation.", "[1]"],
+    ["Per the handbook 【2†source】 travel is capped.", "[2]"],
+    ["Both documents agree [1, 3].", "[1][3]"],
+    ["Stated plainly [ 4 ].", "[4]"],
+    ["A limit applies [2:page 7].", "[2]"],
+  ];
+
+  for (const [input, expected] of cases) {
+    const out = normaliseCitations(input);
+    check(
+      `repairs ${input.match(/[[【][^\]】]*[\]】]/)?.[0] ?? input}`,
+      out.includes(expected),
+      out.replace(/\s+/g, " "),
+    );
+  }
+
+  // A well-formed marker must survive untouched.
+  const clean = "Receipts under GBP 10 [1] need no itemisation [2].";
+  check("leaves well-formed markers alone", normaliseCitations(clean) === clean, clean);
+}
+
+/**
  * The prompt must not tell the supervisor to do the opposite of what it is
  * configured to do.
  *
@@ -141,6 +177,22 @@ function promptComposition() {
     "grounding rules survive in both",
     direct.includes("Never invent a citation number") &&
       delegating.includes("Never invent a citation number"),
+  );
+
+  // Breadth and few rounds have to be asked for together. Capping the rounds
+  // stopped a supervisor that delegated four times and answered nothing, but on
+  // its own it pushed the opposite way: a later turn delegated a single
+  // sub-question, gathered three passages and answered in 477 characters. The
+  // first round is the only one wide enough to matter, so the prompt has to
+  // push for breadth there and restraint afterwards.
+  check(
+    "the delegating prompt asks for breadth in the first round",
+    delegating.includes("one chance at breadth"),
+    "wide first round, few rounds after",
+  );
+  check(
+    "and still discourages extra rounds",
+    delegating.includes("One round is normally enough"),
   );
 }
 
@@ -232,6 +284,28 @@ async function delegationWiring() {
     subagentProviderNames().join(", "),
   );
 
+  // Concurrent branches must hold different credentials. Sharing one compiled
+  // agent per specialist put every branch of a fan-out on a single key, where
+  // they queued behind its per-minute limit: one branch took 12.4s while three
+  // concurrent branches took 128.1s — worse than running them sequentially.
+  // The failure is invisible in the output, which is why it needs a check.
+  const keyOf = (agent: unknown) =>
+    (agent as { options?: { model?: { lc_kwargs?: { apiKey?: string } } } })?.options?.model
+      ?.lc_kwargs?.apiKey ?? "";
+
+  const { buildDelegationTool: build } = await import("../lib/agents/subagents");
+  build(createEvidenceCollector(), { webSearch: false });
+
+  // Reach the pool through a fresh compile: two slots of the same specialist
+  // must not resolve to the same credential.
+  const { getSubagentModel } = await import("../lib/models");
+  const keys = [keyOf({ options: { model: getSubagentModel("pro") } }), keyOf({ options: { model: getSubagentModel("pro") } })];
+  check(
+    "consecutive subagent models draw different credentials",
+    keys[0] !== "" && keys[0] !== keys[1],
+    keys[0] === keys[1] ? "rotation returned the same key twice" : "rotation advances per build",
+  );
+
   check(
     "the turn has a bounded model-call budget",
     SUBAGENT_CONFIG.TURN_MODEL_CALLS > 0 && SUBAGENT_CONFIG.TURN_TOOL_CALLS > 0,
@@ -320,10 +394,20 @@ async function concurrency() {
     "What do the documents say about travel booking?",
   ];
 
+  const invoke = (tasks: Array<{ researcher: string; question: string }>) =>
+    (delegate as unknown as { invoke: (a: unknown) => Promise<string> }).invoke({ tasks });
+
+  // A single branch first, as the unit to compare against. One task is below
+  // AUTO_VERIFY_MIN_FINDINGS, so this times a researcher alone with no
+  // verification attached.
+  const soloStarted = Date.now();
+  await invoke([{ researcher: "document-researcher", question: questions[0] }]);
+  const solo = Date.now() - soloStarted;
+
   const started = Date.now();
-  const out = await (delegate as unknown as { invoke: (a: unknown) => Promise<string> }).invoke({
-    tasks: questions.map((q) => ({ researcher: "document-researcher", question: q })),
-  });
+  const out = await invoke(
+    questions.map((q) => ({ researcher: "document-researcher", question: q })),
+  );
   const elapsed = Date.now() - started;
 
   check(
@@ -336,24 +420,46 @@ async function concurrency() {
   // two numbering schemes in one payload and can cite the wrong thing.
   check(
     "branch labels do not collide with citation markers",
-    !/^s*[d+]s+(document|web)-researcher/m.test(out),
+    !/^\s*\[\d+\]\s+(document|web)-researcher/m.test(out),
     "labels are headed, not bracketed",
   );
 
-  // Three sequential branches against this stack take well over a minute; three
-  // concurrent ones cost about one branch. The threshold sits between those,
-  // generously, so the check fails on a regression to sequential rather than on
-  // an unlucky slow provider.
+  /**
+   * Concurrency as a ratio against one branch, not as a wall-clock threshold.
+   *
+   * An absolute limit measures the provider, not the code. The same code path
+   * timed 19.3s, 70.8s and 139.2s on three consecutive runs, because Cohere's
+   * per-minute quota was progressively more depleted by the testing itself —
+   * so a fixed threshold turns into a coin flip that fails for reasons the
+   * change under test has nothing to do with.
+   *
+   * A ratio moves with those conditions. Sequential execution would cost about
+   * four branch-times here: three researchers one after another, then the
+   * serial verification pass. Concurrent execution costs about two — the
+   * slowest researcher, then verification. Three sits between them with room
+   * on both sides.
+   */
+  const ratio = solo > 0 ? elapsed / solo : Infinity;
   check(
-    "three branches cost roughly one, not three",
-    elapsed < 90_000,
-    `${(elapsed / 1000).toFixed(1)}s for ${questions.length} researchers`,
+    "three branches plus verification cost far less than four sequential",
+    ratio < 3,
+    `${(elapsed / 1000).toFixed(1)}s vs ${(solo / 1000).toFixed(1)}s for one branch ` +
+      `(${ratio.toFixed(1)}x; sequential would be ~4x)`,
   );
 
   check(
     "branch evidence landed in the shared collector",
     collector.documents.length > 0,
     `${collector.documents.length} passages, ${collector.searches.length} searches`,
+  );
+
+  // The verifier must run without being asked. As a prompt step it was skipped
+  // every time: a measured turn started thirteen researchers, all of them
+  // document-researchers, with the verifier configured, bound and never used.
+  check(
+    "an adversarial check ran without being requested",
+    /adversarial check/i.test(out),
+    /adversarial check/i.test(out) ? "verifier fired automatically" : "verifier did not run",
   );
 }
 
@@ -472,6 +578,7 @@ async function liveTurn() {
 
 async function main() {
   citationOrdinals();
+  citationRepair();
   promptComposition();
   await delegationWiring();
   await zodBoundary();

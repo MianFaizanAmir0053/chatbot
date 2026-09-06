@@ -94,8 +94,8 @@ Work the sub-question properly, but only the sub-question you were given:
 
 1. Search with \`search_documents\` using the wording most likely to appear in the document, not the wording of the task.
 2. Read what comes back. It usually reveals better vocabulary than your first query — rare literal terms, section names, the document's own phrasing. Search again with it.
-3. Two or three refined passes are expected. Stop as soon as the sub-question is answered; do not keep searching for its own sake.
-4. If nothing relevant returns after genuinely different phrasings, stop and report the absence.
+3. **Make at most four searches, and stop as soon as the sub-question is answered.** Two or three is usual.
+4. **If two searches with genuinely different wording both return nothing relevant, stop and report the absence.** Do not keep rephrasing. The documents either cover this or they do not, and a prompt "the documents do not address this" is worth far more than a slow one — you are one of several researchers working in parallel, and the supervisor waits for the slowest.
 ${FINDING_CONTRACT}`;
 
 const WEB_RESEARCHER_PROMPT = `You are a web researcher. You investigate one narrow sub-question against public sources and report what you find.
@@ -111,12 +111,15 @@ const VERIFIER_PROMPT = `You are an adversarial verifier. You are given a claim 
 
 You are not here to confirm anything. Your value is entirely in what you find that contradicts, narrows or supersedes the claim:
 
-1. Search for exceptions, conditions, thresholds, effective dates, and superseding rules.
-2. Search for the claim's own terms *negated* — where a document states when something does not apply, or applies differently.
-3. Check whether different documents or sections disagree. If they do, say which says what.
-4. Search wording that would appear in a caveat, not wording that would appear in a confirmation.
+**Make at most three searches.** You already have the findings and their exact wording, so you are not hunting for vocabulary — you are checking a narrow, specific class of thing. Choose your three well:
 
-Report honestly. If you looked and found nothing that undermines the claim, say so plainly — a clean verification is a real result. Do not manufacture doubt.
+1. Exceptions, conditions, thresholds, effective dates and superseding rules.
+2. The claim's own terms *negated* — where a document states when something does not apply, or applies differently.
+3. Wording that would appear in a caveat, not wording that would appear in a confirmation.
+
+Also compare the findings against each other as you read them: where two bear on the same point and disagree, say which says what. That costs no searches at all.
+
+Report honestly and quickly. If nothing you found undermines the claims, say so plainly — a clean verification is a real result, and reaching it fast matters because every other researcher has already finished and the answer is waiting on you. Do not manufacture doubt, and do not keep searching for a caveat that is not there.
 ${FINDING_CONTRACT}`;
 
 /**
@@ -179,6 +182,30 @@ const RESEARCHERS = ["document-researcher", "web-researcher", "verifier"] as con
 type ResearcherName = (typeof RESEARCHERS)[number];
 
 /**
+ * Will this batch trigger the automatic adversarial check?
+ *
+ * Exported so the API layer can show the verifier branch in the UI without
+ * restating the rule. The check runs inside the delegation tool, which has no
+ * route to the event stream, so the alternative was for the route to re-derive
+ * the condition — and a duplicated predicate drifts, leaving the interface
+ * either showing a researcher that never ran or hiding one that did.
+ *
+ * Necessarily an approximation of one part: whether a check has already run
+ * this turn is state inside the tool, so a caller sees "would qualify" rather
+ * than "will run". The route uses it for the first batch, which is the one that
+ * triggers it.
+ */
+export function batchQualifiesForVerification(
+  tasks: Array<{ researcher?: string }>,
+): boolean {
+  return (
+    SUBAGENT_CONFIG.AUTO_VERIFY &&
+    tasks.length >= SUBAGENT_CONFIG.AUTO_VERIFY_MIN_FINDINGS &&
+    !tasks.some((t) => t.researcher === "verifier")
+  );
+}
+
+/**
  * Compile the specialist researchers for this run.
  *
  * Every subagent's tools are built against the *same* evidence collector as the
@@ -188,15 +215,23 @@ type ResearcherName = (typeof RESEARCHERS)[number];
  * when the client renders its sources. The branch's context is isolated; its
  * evidence is not, and must not be.
  *
- * Each researcher type is constructed with its own call to `getSubagentModel`,
- * which advances the credential rotation, and this runs per request — so the
- * specialists hold different keys from each other and from the supervisor, and
- * a later request draws different keys again. The rotation is per researcher
- * *type* rather than per delegation: a subagent is compiled once, so two
- * concurrent `document-researcher` branches share a credential. Spreading those
- * too would need a chat model that rotates internally per invocation, which is
- * a disproportionate amount of delicate wrapping for a burst of three or four
- * calls; `modelFallbackMiddleware` covers the case where a key does give out.
+ * Each specialist is compiled once *per concurrency slot*, not once per type,
+ * and every compilation calls `getSubagentModel` again — which advances the
+ * credential rotation. Branch `i` of a fan-out therefore runs on a different
+ * key from branch `j`.
+ *
+ * That pooling is the whole point, and it was added on evidence. Compiling one
+ * agent per type meant every concurrent `document-researcher` shared a single
+ * model instance and so a single key: the branches dispatched together and then
+ * queued behind one credential's per-minute limit, retrying with backoff. Once
+ * the embedding cache removed Cohere as the dominant cost this became the
+ * binding constraint — a lone branch took 12.4s while three concurrent branches
+ * took 128.1s, which is worse than running them one at a time.
+ *
+ * A pool is the cheap version of the obvious fix. Rotating credentials *inside*
+ * a chat model would mean wrapping streaming, tool binding and structured
+ * output; compiling a handful of agents costs nothing but memory, because
+ * compilation is local work with no network in it.
  */
 function compileResearchers(collector: EvidenceCollector, options: SubagentOptions) {
   const { webSearch = true, resultCache } = options;
@@ -204,14 +239,18 @@ function compileResearchers(collector: EvidenceCollector, options: SubagentOptio
   const researchTools = (label: string, allowWeb: boolean) =>
     buildTools(collector, { webSearch: allowWeb, mode: "focused", resultCache, label });
 
-  const specs: Record<ResearcherName, SubAgent> = {
+  // A factory rather than a literal, because `model` must be evaluated afresh
+  // for every compilation: `getSubagentModel` advances the credential rotation,
+  // so building the spec once would bake one key into every instance and
+  // reintroduce exactly the contention the pool exists to remove.
+  const specFor = (name: ResearcherName): SubAgent => {
+    const base: Record<ResearcherName, Omit<SubAgent, "model">> = {
     "document-researcher": {
       name: "document-researcher",
       description: "Investigates one sub-question against the uploaded documents.",
       systemPrompt: DOCUMENT_RESEARCHER_PROMPT,
       mode: "isolated",
       tools: researchTools("document-researcher", false),
-      model: getSubagentModel("pro"),
       middleware: subagentMiddleware(),
     },
     verifier: {
@@ -220,7 +259,6 @@ function compileResearchers(collector: EvidenceCollector, options: SubagentOptio
       systemPrompt: VERIFIER_PROMPT,
       mode: "isolated",
       tools: researchTools("verifier", false),
-      model: getSubagentModel("pro"),
       middleware: subagentMiddleware(),
     },
     "web-researcher": {
@@ -231,19 +269,24 @@ function compileResearchers(collector: EvidenceCollector, options: SubagentOptio
       // Falls back to the document tools when the web is disabled, so a
       // misaddressed delegation still does useful work rather than failing.
       tools: researchTools("web-researcher", webSearch),
-      model: getSubagentModel("pro"),
       middleware: subagentMiddleware(),
     },
+    };
+    return { ...base[name], model: getSubagentModel("pro") };
   };
 
-  // Compiled lazily and reused: compiling is not free, and a fan-out commonly
-  // addresses the same specialist several times.
-  const compiled = new Map<ResearcherName, ReturnType<typeof createSubAgent>>();
-  return (name: ResearcherName) => {
-    let agent = compiled.get(name);
+  // One compiled agent per (specialist, slot). Compiled lazily, because most
+  // turns never use every slot, and reused for the rest of the run.
+  const pool = new Map<string, ReturnType<typeof createSubAgent>>();
+
+  return (name: ResearcherName, slot = 0) => {
+    // Slots wrap, so a fan-out wider than the pool reuses keys rather than
+    // failing — degraded, not broken.
+    const key = `${name}:${slot % SUBAGENT_CONFIG.MAX_BRANCHES_PER_ROUND}`;
+    let agent = pool.get(key);
     if (!agent) {
-      agent = createSubAgent(specs[name]);
-      compiled.set(name, agent);
+      agent = createSubAgent(specFor(name));
+      pool.set(key, agent);
     }
     return agent;
   };
@@ -280,6 +323,68 @@ export function buildDelegationTool(
 ) {
   const researcherFor = compileResearchers(collector, options);
 
+  /**
+   * Whether this turn's adversarial check has already run.
+   *
+   * Held per tool instance, and `buildDelegationTool` is called once per
+   * request, so it scopes to one turn: the check happens on the first
+   * substantial round and not again on the gap-filling rounds after it.
+   */
+  let verified = false;
+
+  /** Run one branch, returning its finding or a note about why it has none. */
+  const runBranch = async (
+    researcher: ResearcherName,
+    question: string,
+    label: string,
+    // The concurrency slot decides which pooled agent — and so which
+    // credential — this branch runs on. Branches in one fan-out must pass
+    // distinct slots or they collide on a single key's per-minute limit.
+    slot = 0,
+    recursionLimit: number = SUBAGENT_CONFIG.BRANCH_RECURSION_LIMIT,
+  ): Promise<string> => {
+    // Per-branch timing, logged unconditionally.
+    //
+    // A fan-out's cost is not visible from the outside: the tool returns one
+    // value after the slowest branch, so a batch that is silently serialising,
+    // or one branch that is far slower than the rest, looks identical to a
+    // healthy one. Reasoning about it from the total was wrong twice — first
+    // blaming Cohere, then credential contention — and each wrong guess cost a
+    // full measurement cycle. Start and end times per branch settle it.
+    const startedAt = Date.now();
+    console.log(`[branch] ${researcher}#${slot} start +0ms`);
+    const done = (outcome: string) =>
+      console.log(`[branch] ${researcher}#${slot} ${outcome} in ${Date.now() - startedAt}ms`);
+
+    try {
+      const result = await researcherFor(researcher, slot).invoke(
+        { messages: [new HumanMessage(question)] },
+        // Bounded here rather than by middleware inside the branch: a recursion
+        // limit passed at invocation is per-call by construction and cannot be
+        // inherited from the supervisor's state the way the limit middlewares'
+        // counters are.
+        { recursionLimit },
+      );
+
+      const content = result.messages.at(-1)?.content;
+      const text =
+        typeof content === "string"
+          ? content
+          : (content as Array<{ type?: string; text?: string }> | undefined)
+              ?.filter((b) => b?.type === "text")
+              .map((b) => b.text)
+              .join("") ?? "";
+
+      done("ok");
+      return `${label}\n${text.trim() || "(the researcher returned nothing)"}`;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      done("FAILED");
+      console.warn(`[delegate] ${researcher} failed: ${message.slice(0, 120)}`);
+      return `${label}\nFAILED — ${message.slice(0, 200)}\nTreat this sub-question as unresearched.`;
+    }
+  };
+
   return tool(
     async ({ tasks }: { tasks: Array<{ researcher: ResearcherName; question: string }> }) => {
       const batch = tasks.slice(0, SUBAGENT_CONFIG.MAX_BRANCHES_PER_ROUND);
@@ -291,43 +396,64 @@ export function buildDelegationTool(
       );
 
       const findings = await Promise.all(
-        batch.map(async (t, i) => {
-          // Never bracketed. The findings themselves are full of `[1]`, `[2]`
-          // citation markers, and labelling the branches the same way would put
-          // two different numbering schemes in one payload for the supervisor
-          // to confuse — with the failure landing on citations, which are the
-          // one thing here that has to be exactly right.
-          const label = `### Finding ${i + 1} of ${batch.length} · ${t.researcher}\nSub-question: ${t.question}`;
-          try {
-            const result = await researcherFor(t.researcher).invoke(
-              { messages: [new HumanMessage(t.question)] },
-              // Bounded here rather than by middleware inside the branch: a
-              // recursion limit passed at invocation is per-call by
-              // construction and cannot be inherited from the supervisor's
-              // state the way the limit middlewares' counters are.
-              { recursionLimit: SUBAGENT_CONFIG.BRANCH_RECURSION_LIMIT },
-            );
-
-            const last = result.messages.at(-1);
-            const content = last?.content;
-            const text =
-              typeof content === "string"
-                ? content
-                : (content as Array<{ type?: string; text?: string }> | undefined)
-                    ?.filter((b) => b?.type === "text")
-                    .map((b) => b.text)
-                    .join("") ?? "";
-
-            return `${label}\n${text.trim() || "(the researcher returned nothing)"}`;
-          } catch (error) {
-            const message = error instanceof Error ? error.message : String(error);
-            console.warn(`[delegate] ${t.researcher} failed: ${message.slice(0, 120)}`);
-            return `${label}\nFAILED — ${message.slice(0, 200)}\nTreat this sub-question as unresearched.`;
-          }
-        }),
+        batch.map((t, i) =>
+          runBranch(
+            t.researcher,
+            t.question,
+            // Never bracketed. The findings themselves are full of `[1]`, `[2]`
+            // citation markers, and labelling the branches the same way would
+            // put two numbering schemes in one payload for the supervisor to
+            // confuse — with the failure landing on citations, which are the
+            // one thing here that has to be exactly right.
+            `### Finding ${i + 1} of ${batch.length} · ${t.researcher}\nSub-question: ${t.question}`,
+            // The branch index is the concurrency slot, so each concurrent
+            // branch draws a different pooled agent and therefore a different
+            // credential. Passing a constant here would put the whole fan-out
+            // back on one key.
+            i,
+          ),
+        ),
       );
 
-      return `${findings.length} finding(s):\n\n${findings.join("\n\n---\n\n")}`;
+      const sections = [...findings];
+
+      // The adversarial pass, run here rather than asked for in the prompt.
+      // See SUBAGENT_CONFIG.AUTO_VERIFY: as a workflow step it was skipped every
+      // time, and a check that only runs when the answer already looks complete
+      // is the one that never runs at all.
+      // `batchQualifiesForVerification` also covers the supervisor having asked
+      // for a verifier itself, in which case checking twice would spend a
+      // branch to reach the same conclusion.
+      const substantial = !verified && batchQualifiesForVerification(batch);
+
+      if (substantial) {
+        verified = true;
+        console.log("[delegate] adversarial verification of the findings");
+
+        // Sequential by necessity: the verifier's input is what the researchers
+        // returned, so it cannot overlap with them.
+        sections.push(
+          await runBranch(
+            "verifier",
+            "Below are research findings drawn from the user's documents. Identify the " +
+              "load-bearing claims and attack them: search for exceptions, conditions, " +
+              "thresholds, effective dates, superseding rules, and any place two documents " +
+              "disagree. Report only what genuinely undermines, narrows or qualifies a " +
+              "claim, and say plainly if you find nothing.\n\n" +
+              findings.join("\n\n---\n\n"),
+            "### Adversarial check of the findings above · verifier",
+            0,
+            // Tighter than a researcher's: this branch is serial, so its cost
+            // lands whole on the turn.
+            SUBAGENT_CONFIG.VERIFY_RECURSION_LIMIT,
+          ),
+        );
+      }
+
+      return (
+        `${findings.length} finding(s)${substantial ? " and an adversarial check" : ""}:\n\n` +
+        sections.join("\n\n---\n\n")
+      );
     },
     {
       name: "delegate_research",

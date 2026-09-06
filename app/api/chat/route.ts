@@ -2,10 +2,12 @@ import { NextRequest } from "next/server";
 import { randomUUID } from "crypto";
 import { HumanMessage } from "@langchain/core/messages";
 import { buildAgent, runConfig } from "@/lib/agents/agent";
+import { batchQualifiesForVerification } from "@/lib/agents/subagents";
 import { hasReasoningProvider } from "@/lib/config";
 import { ChatRequestSchema, guardInput } from "@/lib/guardrails/input";
 import {
   checkGroundedness,
+  normaliseCitations,
   stripInvalidCitations,
   validateCitations,
 } from "@/lib/guardrails/output";
@@ -213,6 +215,8 @@ export async function POST(req: NextRequest) {
     const reportedCalls = new Set<string>();
     /** Tool results already reported, for the same reason. */
     const reportedResults = new Set<string>();
+    /** The automatic verification branch is announced once per turn. */
+    let verificationShown = false;
 
     const stream = await agent.stream(
       { messages: [new HumanMessage(message)] },
@@ -301,13 +305,27 @@ export async function POST(req: NextRequest) {
                 // One call starts a whole batch, so report each branch
                 // separately — the fan-out is precisely what the user is
                 // waiting on, and a single "delegate_research" row hides it.
-                (args.tasks ?? []).forEach((t, i) => {
+                const tasks = args.tasks ?? [];
+                tasks.forEach((t, i) => {
                   emit("delegation", {
                     id: `${id}:${i}`,
                     agent: t.researcher ?? "researcher",
                     task: t.question ?? "",
                   });
                 });
+
+                // The adversarial check runs inside the tool rather than being
+                // requested by the model, so it appears in no tool call. Left
+                // unreported the user watches every researcher finish and then
+                // waits through an unexplained pause while it runs.
+                if (!verificationShown && batchQualifiesForVerification(tasks)) {
+                  verificationShown = true;
+                  emit("delegation", {
+                    id: `${id}:verify`,
+                    agent: "verifier",
+                    task: "Attacking the findings: exceptions, conditions, limits, conflicts",
+                  });
+                }
                 continue;
               }
 
@@ -352,16 +370,58 @@ export async function POST(req: NextRequest) {
         ? answer.replace(/\s+/g, " ").slice(0, 300)
         : "The model returned no output.";
       console.error(`[chat] no usable answer: ${detail}`);
+
+      // Two very different failures reach this point and they must not be
+      // reported as one. If retrieval gathered evidence, the providers plainly
+      // answered — the agent simply spent its turn researching and never wrote
+      // the answer up, which a delegating run can do by chasing one gap after
+      // another. Blaming that on a rate limit sends the user to check billing
+      // for a problem that is entirely on this side, and hides the evidence the
+      // run did collect.
+      const researched = collector.documents.length > 0 || collector.searches.length > 0;
+
       emit("error", {
-        message:
-          "Every configured model provider refused the request — most often a rate limit " +
-          `or an exhausted balance. Details: ${detail}`,
+        message: researched
+          ? "The research completed but no answer was written — the turn ran out of budget " +
+            `before synthesising. It gathered ${collector.documents.length} passage(s) across ` +
+            `${collector.searches.length} search(es). Asking a narrower question usually gets ` +
+            "an answer from the same evidence."
+          : "Every configured model provider refused the request — most often a rate limit " +
+            `or an exhausted balance. Details: ${detail}`,
       });
+
+      // The sources are still worth sending: they are what the run actually
+      // established, and they let the user see the research rather than only
+      // the failure.
+      if (researched) {
+        emit("sources", {
+          documents: collector.documents.map((d, i) => ({
+            index: i + 1,
+            source: d.doc.metadata?.source,
+            section: d.doc.metadata?.section,
+            page: d.doc.metadata?.page,
+            score: d.score,
+            excerpt: String(d.doc.metadata?.originalText ?? d.doc.pageContent).slice(0, 400),
+          })),
+          web: collector.webResults,
+          searches: collector.searches,
+        });
+      }
       return;
     }
 
     /* --- Output guardrails --- */
     emit("status", { stage: "verifying" });
+
+    // Repair near-miss marker formats before validating. A marker the validator
+    // does not recognise is not caught as invalid — it is not seen at all, so
+    // the answer passes with a broken citation still in the text.
+    const normalised = normaliseCitations(answer);
+    if (normalised !== answer) {
+      console.warn("[chat] repaired non-standard citation markers");
+      answer = normalised;
+      emit("revised_answer", { text: answer });
+    }
 
     const citations = validateCitations(answer, collector.documents);
     if (!citations.valid) {

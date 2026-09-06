@@ -343,6 +343,26 @@ class RotatingCohereEmbeddings extends Embeddings {
   private readonly clients: CohereEmbeddings[];
   private cursor = 0;
 
+  /**
+   * Query embeddings already computed, keyed by the exact text.
+   *
+   * Cohere is the one dependency this system cannot spread across keys —
+   * embeddings and reranking both go to it, and it is what rate-limits a
+   * fan-out. Query text repeats constantly: researchers on neighbouring
+   * sub-questions reach for the same obvious phrasing, a second round re-asks
+   * what the first already asked, and a follow-up question in the same
+   * conversation repeats the one before it. Every one of those was a fresh
+   * embedding call against the binding constraint.
+   *
+   * Safe because the model is fixed and embedding is deterministic: the same
+   * text always yields the same vector, so a hit is indistinguishable from a
+   * call except in latency and quota.
+   *
+   * Only queries are cached. Document embedding happens once per chunk at
+   * ingest and never repeats, so caching it would spend memory to no purpose.
+   */
+  private readonly queryCache = new Map<string, number[]>();
+
   constructor(keys: string[]) {
     super({});
     this.clients = keys.map(
@@ -374,10 +394,32 @@ class RotatingCohereEmbeddings extends Embeddings {
     return this.withFailover((client) => client.embedDocuments(texts));
   }
 
-  embedQuery(text: string): Promise<number[]> {
-    return this.withFailover((client) => client.embedQuery(text));
+  async embedQuery(text: string): Promise<number[]> {
+    const cached = this.queryCache.get(text);
+    if (cached) return cached;
+
+    const vector = await this.withFailover((client) => client.embedQuery(text));
+
+    // Bounded so a long-lived process cannot grow without limit. Oldest-first
+    // eviction, which for this access pattern is close to least-recently-used:
+    // repeats cluster inside a turn and a query from an hour ago is not coming
+    // back.
+    if (this.queryCache.size >= EMBEDDING_CACHE_LIMIT) {
+      const oldest = this.queryCache.keys().next().value;
+      if (oldest !== undefined) this.queryCache.delete(oldest);
+    }
+    this.queryCache.set(text, vector);
+    return vector;
+  }
+
+  /** Cache occupancy, for /api/health. */
+  cacheSize(): number {
+    return this.queryCache.size;
   }
 }
+
+/** Query vectors held at once. Each is ~1536 floats, so this is a few megabytes. */
+const EMBEDDING_CACHE_LIMIT = 500;
 
 let embeddingsSingleton: Embeddings | null = null;
 

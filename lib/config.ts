@@ -620,12 +620,19 @@ export const SUBAGENT_CONFIG = {
    * Separate from the width because the two bound different things and
    * conflating them understates the total badly: one number serving as both a
    * per-call cap and a per-turn cap reads like a limit of six branches while
-   * actually permitting thirty-six. Three rounds is what the workflow asks for
-   * — the opening fan-out, a verification pass, and one round to close gaps —
-   * so the real ceiling is eighteen branches, and the turn's shared model-call
-   * budget binds well before that.
+   * actually permitting thirty-six.
+   *
+   * Two, not three, and the reason is behavioural rather than arithmetic. Once
+   * verification became automatic the opening round no longer needed a round of
+   * its own to follow it, and a supervisor given three rounds used all of them:
+   * a measured turn delegated four researchers, then two, then one, then hit
+   * the cap and finished with an empty answer after 344 seconds. Each round
+   * chased a smaller gap than the last, and none of them was worth the turn's
+   * remaining budget. One round of research plus one to close a named gap is
+   * the shape the workflow actually needs; the prompt says so too, and both
+   * saying it is deliberate.
    */
-  MAX_DELEGATION_ROUNDS: 3,
+  MAX_DELEGATION_ROUNDS: 2,
 
   /**
    * Model calls for a whole delegating turn — supervisor and branches together.
@@ -669,12 +676,20 @@ export const SUBAGENT_CONFIG = {
    * counters live in state a subagent inherits from its parent — it is scoped
    * to that single call and cannot be pre-consumed by the supervisor.
    *
-   * A researcher runs a much shorter middleware stack than the supervisor, so a
-   * model turn costs far fewer steps here; 60 is roughly six turns, which is
-   * ample for search, re-search and report, and stops a stalled branch well
-   * before it could exhaust the turn's shared model-call budget.
+   * Sized against the straggler, not the average. Per-branch timing showed the
+   * fan-out itself was healthy — three branches started together and two
+   * finished in 13.8s and 16.3s — while the third took 85.6s and set the whole
+   * round's duration. It was researching a sub-question the documents do not
+   * answer, and the instruction to try "genuinely different phrasings" before
+   * reporting an absence has no natural stopping point: it searched until the
+   * budget stopped it.
+   *
+   * A branch is one narrow sub-question, and roughly four searches settle it
+   * either way. Capping it converts a straggler into a prompt, honest "the
+   * documents do not address this" — which is the same answer the long version
+   * reached, several minutes sooner.
    */
-  BRANCH_RECURSION_LIMIT: 60,
+  BRANCH_RECURSION_LIMIT: 36,
 
   /**
    * Full retrieval pipelines allowed to run at once, across all branches.
@@ -688,11 +703,69 @@ export const SUBAGENT_CONFIG = {
    * rotation spent its time failing over: the fan-out became *slower* than
    * running the branches one at a time, which is the opposite of the point.
    *
-   * Three keeps the branches genuinely overlapped on the model calls — where
-   * the latency actually is — while holding Cohere concurrency at a level the
-   * quota sustains. Retrieval queues briefly instead of stampeding.
+   * Six, and the number moved because the cost of a search did. This limit was
+   * first set to three while a branch search still ran query expansion — three
+   * embedding calls and a rerank apiece, so three concurrent searches meant
+   * nine embeddings in flight. Branches no longer expand, so a search is one
+   * embedding and one rerank, and six concurrent searches place *less* load on
+   * Cohere than the old three did. Leaving it at three would have throttled the
+   * fan-out against a cost that no longer exists — half of a six-branch round
+   * queueing for no reason.
+   *
+   * The headroom is measured rather than assumed: a full delegating turn with
+   * eight branches drew only two Cohere rate-limit responses, against eight
+   * rotating keys.
    */
-  RETRIEVAL_CONCURRENCY: 3,
+  RETRIEVAL_CONCURRENCY: 6,
+
+  /**
+   * Run an adversarial check automatically once per delegating turn, on the
+   * first substantial round of findings.
+   *
+   * Verification was a step in the supervisor's workflow — "delegate the
+   * load-bearing claims to `verifier`" — and it never happened. A measured turn
+   * started thirteen researchers and every one of them was a
+   * `document-researcher`: the verifier and the web researcher were configured,
+   * bound and dead. That is the same failure as the supervisor that would not
+   * delegate, in a new place. An instruction the model may skip is not a
+   * guarantee, and the more optional a step looks the more reliably it is
+   * dropped when the answer already seems complete.
+   *
+   * So the check moved out of the prompt and into the tool, where it is not a
+   * decision. It costs one extra branch per turn, and unlike the researchers it
+   * cannot run concurrently with them — it has to read what they found — so it
+   * is deliberately once per turn rather than once per round.
+   */
+  AUTO_VERIFY: true,
+
+  /**
+   * Findings a round needs before it is worth attacking.
+   *
+   * A single finding is usually a gap-filling lookup rather than a claim the
+   * answer rests on, and verifying it spends a branch to little effect.
+   */
+  AUTO_VERIFY_MIN_FINDINGS: 2,
+
+  /**
+   * Graph steps the automatic verifier may take — tighter than a researcher's.
+   *
+   * Verification is the one branch that cannot overlap with anything: it reads
+   * what the researchers found, so it runs after them and its cost lands
+   * directly on the turn. Measured at the full branch limit it added roughly
+   * fifty seconds to a twenty-second fan-out, spending six searches.
+   *
+   * It does not need many. A researcher is answering an open question and has
+   * to find the right vocabulary; the verifier already has the findings and
+   * their wording, and is looking for a specific, narrow class of thing —
+   * exceptions, thresholds, effective dates, contradictions. If the documents
+   * hold no caveat, more searching was never going to find one.
+   *
+   * Measured at 30 it still took 72.2 seconds against a fan-out whose branches
+   * took 14 and 16 — close to half the turn, spent entirely after the
+   * researchers had finished. Twenty steps is roughly three targeted searches
+   * and a report, which is what the job actually is.
+   */
+  VERIFY_RECURSION_LIMIT: 20,
 
   /** Recommended fan-out width, stated in the prompt so delegations batch. */
   TARGET_PARALLEL_WIDTH: 4,

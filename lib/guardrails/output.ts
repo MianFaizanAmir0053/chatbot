@@ -38,6 +38,14 @@ export interface GroundednessReport {
 }
 
 /**
+ * Passages sent to the groundedness judge.
+ *
+ * Enough to cover a well-cited answer plus a little context, far short of a
+ * delegating turn's full evidence set.
+ */
+const GROUNDEDNESS_MAX_EXCERPTS = 12;
+
+/**
  * LLM-as-judge faithfulness check on the generated answer.
  *
  * This is the last line of defence against the failure mode that matters most in
@@ -56,8 +64,41 @@ export async function checkGroundedness(
     return { score: 1, verdict: "grounded", unsupportedClaims: [], passed: true };
   }
 
-  const excerpts = documents
-    .map((d, i) => `[${i + 1}] ${String(d.doc.metadata?.originalText ?? d.doc.pageContent)}`)
+  // Judge against the passages the answer actually cites, not the whole run's
+  // evidence.
+  //
+  // Delegated research changed the scale of this. A single-agent turn gathered
+  // a handful of passages; a fan-out of six researchers gathers around thirty,
+  // and sending all of them meant a very large prompt to the judge for every
+  // answer — serial, after the user is already reading, and mostly made of
+  // passages the answer never mentions.
+  //
+  // Restricting to cited passages is also more accurate, not merely cheaper:
+  // the question is whether each claim is supported by what it cites. A few
+  // top-ranked uncited passages are kept as well, so that a claim citing
+  // nothing can still be recognised as supported rather than scored as
+  // unsupported by construction.
+  const citedOrdinals = new Set(
+    [...answer.matchAll(/\[(\d+)\]/g)].map((m) => Number(m[1])).filter((n) => n >= 1),
+  );
+
+  const numbered = documents.map((ranked, i) => ({ ranked, ordinal: i + 1 }));
+  const selected = numbered.filter((d) => citedOrdinals.has(d.ordinal));
+
+  for (const candidate of numbered) {
+    if (selected.length >= GROUNDEDNESS_MAX_EXCERPTS) break;
+    if (!citedOrdinals.has(candidate.ordinal)) selected.push(candidate);
+  }
+
+  // Ordinals must survive the filter. Renumbering the excerpts here would make
+  // the judge's view of "[7]" a different passage from the answer's, and every
+  // citation would look unsupported.
+  const excerpts = selected
+    .sort((a, b) => a.ordinal - b.ordinal)
+    .map(
+      ({ ranked, ordinal }) =>
+        `[${ordinal}] ${String(ranked.doc.metadata?.originalText ?? ranked.doc.pageContent)}`,
+    )
     .join("\n\n");
 
   try {
@@ -85,6 +126,49 @@ export async function checkGroundedness(
     console.error("[guardrails] groundedness check failed, passing through:", error);
     return { score: -1, verdict: "grounded", unsupportedClaims: [], passed: true };
   }
+}
+
+/**
+ * Repair citation markers the model wrote in a near-miss format.
+ *
+ * Validation only recognises `[n]`, and anything else slips through every check
+ * as though the answer cited nothing at all: no refs are found, so none can be
+ * invalid, so the answer is "valid" and the malformed marker is handed to the
+ * user unresolved. A measured run produced `[1†L1-L3]` — a citation style from
+ * a different vendor's file-search tooling — and the pipeline reported the
+ * answer as having no citations while displaying that text verbatim.
+ *
+ * Silence is what makes this worth fixing rather than merely prompting against.
+ * A fabricated number is caught and stripped; a marker in the wrong *shape* is
+ * not caught at all, and the failure is invisible precisely when the model is
+ * trying hardest to attribute a claim.
+ *
+ * Normalising rather than deleting keeps the intent. `[1†L1-L3]` plainly means
+ * passage 1, and once it is `[1]` the ordinary validator can confirm or reject
+ * it on the merits.
+ */
+export function normaliseCitations(answer: string): string {
+  return (
+    answer
+      // Unicode brackets, as in 【1†source】.
+      .replace(/【\s*(\d+)[^】]*】/g, "[$1]")
+      // Several numbers in one bracket: [1, 2] and [1;2] become [1][2].
+      //
+      // Must precede the suffix rule below, which would otherwise match `[1, 3]`
+      // first — reading the comma as the start of a suffix and discarding every
+      // number after the first. Losing a citation silently is exactly the class
+      // of failure this function exists to stop, so the order is load-bearing.
+      .replace(/\[\s*(\d+(?:\s*[,;]\s*\d+)+)\s*\]/g, (_, group: string) =>
+        group
+          .split(/[,;]/)
+          .map((n) => `[${n.trim()}]`)
+          .join(""),
+      )
+      // A bracketed number carrying a suffix: [1†L1-L3], [1:page 4], [1 - policy].
+      .replace(/\[\s*(\d+)\s*[^\]\d\s][^\]]*\]/g, "[$1]")
+      // Stray whitespace inside an otherwise well-formed marker.
+      .replace(/\[\s+(\d+)\s*\]|\[\s*(\d+)\s+\]/g, (_, a: string, b: string) => `[${a ?? b}]`)
+  );
 }
 
 /**

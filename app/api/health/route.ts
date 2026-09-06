@@ -138,6 +138,11 @@ export async function GET() {
       SUBAGENT_CONFIG.MAX_BRANCHES_PER_ROUND * SUBAGENT_CONFIG.MAX_DELEGATION_ROUNDS,
     // One budget for the turn, supervisor and branches together — the limiter's
     // tally lives in shared state, so it counts both.
+    // Reported because it is the difference between a verification step that
+    // exists and one that runs: as a prompt instruction it was skipped on every
+    // measured turn.
+    autoVerify: SUBAGENT_CONFIG.AUTO_VERIFY,
+    retrievalConcurrency: SUBAGENT_CONFIG.RETRIEVAL_CONCURRENCY,
     turnModelCalls: SUBAGENT_CONFIG.TURN_MODEL_CALLS,
     turnToolCalls: SUBAGENT_CONFIG.TURN_TOOL_CALLS,
   };

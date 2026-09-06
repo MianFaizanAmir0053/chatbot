@@ -89,6 +89,8 @@ type Health = {
       branchesPerRound?: number;
       maxRounds?: number;
       maxBranches?: number;
+      autoVerify?: boolean;
+      retrievalConcurrency?: number;
       turnModelCalls?: number;
       turnToolCalls?: number;
     };
@@ -372,6 +374,14 @@ export default function DashboardPage() {
                   />
                   <Row label="Researchers">
                     Documents · Web · Verifier
+                  </Row>
+                  <Row label="Adversarial check">
+                    <Pill tone={checks.delegation?.autoVerify ? "success" : "warn"}>
+                      {checks.delegation?.autoVerify ? "automatic" : "on request only"}
+                    </Pill>
+                  </Row>
+                  <Row label="Concurrent retrievals">
+                    {checks.delegation?.retrievalConcurrency ?? "—"}
                   </Row>
                   <Row label="Parallel branches per round">
                     {checks.delegation?.branchesPerRound ?? "—"}

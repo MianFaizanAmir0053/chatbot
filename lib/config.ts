@@ -65,7 +65,15 @@ const EnvSchema = z.object({
    */
   LLM_PROVIDER_ORDER: z.string().optional(),
 
-  // --- Embeddings + reranking ---
+  /**
+   * Embeddings and reranking. Accepts a comma-separated list of keys.
+   *
+   * Cohere is the one hard single point of failure here: it is the only source
+   * of both embeddings and reranking, so exhausting its quota does not degrade
+   * retrieval, it stops it. Trial keys meter rerank especially tightly. Listing
+   * several lets a rate-limited call move to the next key instead of dropping
+   * the request to fusion order.
+   */
   COHERE_API_KEY: z.string().optional(),
 
   // --- Vector database ---
@@ -281,6 +289,26 @@ export const LLM_PROVIDERS: LlmProvider[] = (() => {
     return true;
   });
 })();
+
+/**
+ * Every configured Cohere key, in order.
+ *
+ * Callers rotate through these on a rate limit. Duplicates are dropped so a key
+ * pasted twice does not make the retry budget look larger than it is.
+ */
+export const COHERE_API_KEYS: string[] = [
+  ...new Set(
+    (env.COHERE_API_KEY ?? "")
+      .split(",")
+      // Strip surrounding quotes per key, not just around the whole value.
+      // A single quoted key is unwrapped by the env loader, but the moment a
+      // second is appended the value stops being one quoted string and the
+      // loader leaves the quotes in place — so the first key silently becomes
+      // `"abc` and every call with it returns 401.
+      .map((k) => k.trim().replace(/^["']|["']$/g, "").trim())
+      .filter(Boolean),
+  ),
+];
 
 export const EMBEDDING_CONFIG = {
   model: "embed-v4.0",

@@ -1,19 +1,24 @@
 import { CohereRerank } from "@langchain/cohere";
 import type { Document } from "@langchain/core/documents";
-import { RERANK_CONFIG, RETRIEVAL_CONFIG, env, features } from "../config";
+import { COHERE_API_KEYS, RERANK_CONFIG, RETRIEVAL_CONFIG } from "../config";
 import type { FusedDocument } from "./hybrid";
 
-let reranker: CohereRerank | null = null;
+let rerankers: CohereRerank[] | null = null;
 
-function getReranker(): CohereRerank | null {
-  if (!features.cohere) return null;
-  if (!reranker) {
-    reranker = new CohereRerank({
-      apiKey: env.COHERE_API_KEY,
-      model: RERANK_CONFIG.model,
-    });
+/**
+ * One reranker per configured key.
+ *
+ * Rerank is the most aggressively metered Cohere endpoint on a trial key, and
+ * losing it costs precision for the whole request — the pipeline falls back to
+ * fusion order. Holding every key lets a 429 move to the next one instead.
+ */
+function getRerankers(): CohereRerank[] {
+  if (!rerankers) {
+    rerankers = COHERE_API_KEYS.map(
+      (apiKey) => new CohereRerank({ apiKey, model: RERANK_CONFIG.model }),
+    );
   }
-  return reranker;
+  return rerankers;
 }
 
 export interface RankedDocument {
@@ -37,6 +42,19 @@ function fusionFallback(candidates: FusedDocument[], topN: number): RankedDocume
 const isRateLimit = (error: unknown): boolean => {
   const message = error instanceof Error ? error.message : String(error);
   return /429|rate.?limit|too many requests/i.test(message);
+};
+
+/**
+ * True for failures another key could survive.
+ *
+ * Wider than isRateLimit deliberately: a revoked or exhausted key reports 401,
+ * 403 or a quota message rather than 429, and treating only 429 as recoverable
+ * would drop the whole request to fusion order while a perfectly good second
+ * key sat unused.
+ */
+const isKeyProblem = (error: unknown): boolean => {
+  const message = error instanceof Error ? error.message : String(error);
+  return isRateLimit(error) || /401|403|quota|invalid api key|unauthor/i.test(message);
 };
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -88,39 +106,51 @@ export async function rerankDocuments(
 ): Promise<RankedDocument[]> {
   if (candidates.length === 0) return [];
 
-  const cohere = getReranker();
-  if (!cohere) return fusionFallback(candidates, topN);
+  const clients = getRerankers();
+  if (clients.length === 0) return fusionFallback(candidates, topN);
 
-  // Rerank endpoints are aggressively rate limited on trial keys, and a retry
-  // is much cheaper than losing precision for the whole request.
-  const MAX_ATTEMPTS = 3;
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
-    try {
-      const results = await cohere.rerank(
-        candidates.map((c) => c.doc.pageContent),
-        query,
-        { model: RERANK_CONFIG.model, topN: Math.min(topN * 2, candidates.length) },
-      );
+  // Rerank endpoints are aggressively rate limited on trial keys, and both a
+  // retry and a different key are much cheaper than losing precision for the
+  // whole request. Keys are tried first — moving on costs nothing, where a
+  // backoff costs latency — and the backoff only applies once they are all
+  // rate limited, which means the quota is genuinely gone rather than one key
+  // being briefly hot.
+  const MAX_ROUNDS = 3;
+  for (let round = 1; round <= MAX_ROUNDS; round += 1) {
+    for (const [index, cohere] of clients.entries()) {
+      try {
+        const results = await cohere.rerank(
+          candidates.map((c) => c.doc.pageContent),
+          query,
+          { model: RERANK_CONFIG.model, topN: Math.min(topN * 2, candidates.length) },
+        );
 
-      const ranked: RankedDocument[] = results.map((r) => ({
-        doc: candidates[r.index].doc,
-        score: r.relevanceScore,
-        retrievers: candidates[r.index].retrievers,
-        reranked: true,
-      }));
+        const ranked: RankedDocument[] = results.map((r) => ({
+          doc: candidates[r.index].doc,
+          score: r.relevanceScore,
+          retrievers: candidates[r.index].retrievers,
+          reranked: true,
+        }));
 
-      return applyAdaptiveCutoff(ranked, topN);
-    } catch (error) {
-      if (isRateLimit(error) && attempt < MAX_ATTEMPTS) {
-        const backoff = 500 * 2 ** (attempt - 1);
-        console.warn(`[rerank] rate limited, retrying in ${backoff}ms (${attempt}/${MAX_ATTEMPTS})`);
-        await sleep(backoff);
-        continue;
+        return applyAdaptiveCutoff(ranked, topN);
+      } catch (error) {
+        if (!isKeyProblem(error)) {
+          console.error("[rerank] failed, falling back to fusion order:", error);
+          return fusionFallback(candidates, topN);
+        }
+        console.warn(
+          `[rerank] key ${index + 1}/${clients.length} unusable (round ${round}/${MAX_ROUNDS})`,
+        );
       }
-      console.error("[rerank] failed, falling back to fusion order:", error);
-      return fusionFallback(candidates, topN);
+    }
+
+    if (round < MAX_ROUNDS) {
+      const backoff = 500 * 2 ** (round - 1);
+      console.warn(`[rerank] every key rate limited, retrying in ${backoff}ms`);
+      await sleep(backoff);
     }
   }
 
+  console.error("[rerank] all keys exhausted, falling back to fusion order");
   return fusionFallback(candidates, topN);
 }

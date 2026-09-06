@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { activeSearchProvider } from "@/lib/agents/websearch";
-import { LLM_PROVIDERS, MODEL_TIERS, RERANK_CONFIG, env, features } from "@/lib/config";
+import { COHERE_API_KEYS, LLM_PROVIDERS, MODEL_TIERS, RERANK_CONFIG, env, features } from "@/lib/config";
 import { activeModelId, activeProviderName } from "@/lib/models";
 import { sparseIndexStats } from "@/lib/retrieval/hybrid";
 import { s3Healthy } from "@/lib/s3";
@@ -62,6 +62,14 @@ export async function GET() {
 
   checks.retrieval = {
     embeddings: features.cohere ? "cohere:embed-v4.0" : "unavailable (COHERE_API_KEY missing)",
+    /**
+     * How many Cohere keys back embeddings and reranking.
+     *
+     * Worth surfacing on its own: Cohere is the only source of both, so this
+     * number is how many rate limits retrieval can absorb before it degrades
+     * to fusion order.
+     */
+    cohereKeys: COHERE_API_KEYS.length,
     reranker: features.cohere ? `cohere:${RERANK_CONFIG.model}` : "disabled",
     sparseIndex: sparseIndexStats(),
   };

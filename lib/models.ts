@@ -2,7 +2,9 @@ import { ChatDeepSeek } from "@langchain/deepseek";
 import { ChatOpenAI } from "@langchain/openai";
 import { ChatCohere, CohereEmbeddings } from "@langchain/cohere";
 import type { BaseChatModel } from "@langchain/core/language_models/chat_models";
+import { Embeddings } from "@langchain/core/embeddings";
 import {
+  COHERE_API_KEYS,
   COHERE_MODELS,
   EMBEDDING_CONFIG,
   FALLBACK_MODELS,
@@ -36,7 +38,8 @@ export interface ModelOptions {
 function cohereModel(tier: ModelTier, temperature: number): BaseChatModel {
   return new ChatCohere({
     model: tier === "pro" ? COHERE_MODELS.PRO : COHERE_MODELS.FAST,
-    apiKey: env.COHERE_API_KEY,
+    // First key only: a comma-separated list is not a credential.
+    apiKey: COHERE_API_KEYS[0],
     temperature,
   }) as unknown as BaseChatModel;
 }
@@ -202,21 +205,79 @@ export function activeModelId(tier: ModelTier = "pro"): string {
   return "none";
 }
 
-let embeddingsSingleton: CohereEmbeddings | null = null;
+/**
+ * True for the failures another key could survive.
+ *
+ * A rate limit or an exhausted/invalid key is worth retrying elsewhere; a
+ * malformed request is not, and would only waste every remaining key before
+ * reporting the same error.
+ */
+function isKeyExhausted(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /429|rate.?limit|too many requests|401|403|quota|invalid api key/i.test(message);
+}
+
+/**
+ * Embeddings across every configured Cohere key.
+ *
+ * Presented as one object because the vector stores construct their embedder
+ * once and hold it for the process; swapping keys has to happen inside that
+ * object rather than by handing callers a different one. Rotation starts from
+ * the last key that worked, so a exhausted key is skipped on subsequent calls
+ * instead of being retried first every time.
+ */
+class RotatingCohereEmbeddings extends Embeddings {
+  private readonly clients: CohereEmbeddings[];
+  private cursor = 0;
+
+  constructor(keys: string[]) {
+    super({});
+    this.clients = keys.map(
+      (apiKey) => new CohereEmbeddings({ apiKey, model: EMBEDDING_CONFIG.model }),
+    );
+  }
+
+  private async withFailover<T>(run: (client: CohereEmbeddings) => Promise<T>): Promise<T> {
+    let lastError: unknown;
+
+    for (let attempt = 0; attempt < this.clients.length; attempt++) {
+      const index = (this.cursor + attempt) % this.clients.length;
+      try {
+        const result = await run(this.clients[index]);
+        this.cursor = index;
+        return result;
+      } catch (error) {
+        lastError = error;
+        if (!isKeyExhausted(error)) throw error;
+        console.warn(
+          `[cohere] embeddings key ${index + 1}/${this.clients.length} exhausted, trying the next`,
+        );
+      }
+    }
+    throw lastError;
+  }
+
+  embedDocuments(texts: string[]): Promise<number[][]> {
+    return this.withFailover((client) => client.embedDocuments(texts));
+  }
+
+  embedQuery(text: string): Promise<number[]> {
+    return this.withFailover((client) => client.embedQuery(text));
+  }
+}
+
+let embeddingsSingleton: Embeddings | null = null;
 
 /**
  * Embeddings are a process-wide singleton: the client is stateless but holds a
  * connection pool, and re-creating it per request wastes sockets under load.
  */
-export function getEmbeddings(): CohereEmbeddings {
-  if (!features.cohere) {
+export function getEmbeddings(): Embeddings {
+  if (COHERE_API_KEYS.length === 0) {
     throw new Error("COHERE_API_KEY is required for embeddings.");
   }
   if (!embeddingsSingleton) {
-    embeddingsSingleton = new CohereEmbeddings({
-      apiKey: env.COHERE_API_KEY,
-      model: EMBEDDING_CONFIG.model,
-    });
+    embeddingsSingleton = new RotatingCohereEmbeddings(COHERE_API_KEYS);
   }
   return embeddingsSingleton;
 }

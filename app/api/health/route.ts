@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { activeSearchProvider } from "@/lib/agents/websearch";
 import { COHERE_API_KEYS, LLM_PROVIDERS, MODEL_TIERS, RERANK_CONFIG, env, features } from "@/lib/config";
-import { activeModelId, activeProviderName } from "@/lib/models";
+import { activeModelId, activeProviderName, primaryKeyCount } from "@/lib/models";
 import { sparseIndexStats } from "@/lib/retrieval/hybrid";
 import { s3Healthy } from "@/lib/s3";
 import { getVectorStore } from "@/lib/vectorstore";
@@ -58,6 +58,11 @@ export async function GET() {
     }),
     /** Total entries actually tried, which is what bounds failover depth. */
     chainDepth: LLM_PROVIDERS.length,
+    /**
+     * Keys the primary provider rotates through, one per model call.
+     * Free tiers meter per key, so this multiplies the daily ceiling.
+     */
+    keyRotation: primaryKeyCount(),
     pro: activeModelId("pro"),
     fast: activeModelId("fast"),
     configuredTiers: MODEL_TIERS,

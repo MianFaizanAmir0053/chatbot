@@ -10,6 +10,7 @@ import {
   FALLBACK_MODELS,
   LLM_PROVIDERS,
   MODEL_TIERS,
+  splitKeys,
   type LlmProvider,
   env,
   features,
@@ -61,13 +62,57 @@ function openAIModel(tier: ModelTier, temperature: number, maxTokens?: number): 
  * semantics are identical across providers, so callers never branch on which
  * one is active.
  */
+/**
+ * Round-robin cursor over the leading provider's keys.
+ *
+ * Deliberately rotates keys and not models. Free tiers meter per key, so
+ * spreading calls across eight keys multiplies the daily ceiling eightfold and
+ * leaves each key's short-term rate limit largely untouched. Because the
+ * endpoint and model never change, every request is served by exactly the same
+ * model — rotation costs nothing in answer quality.
+ *
+ * Rotating across *models* was tried and reverted: models differ in whether
+ * they can drive the agent loop at all, so it made quality a coin flip per
+ * request. Model choice stays fixed and ordered by measured competence; only
+ * the credential moves.
+ */
+let keyCursor = 0;
+let lastPrimaryKey = "";
+
+/** Every key configured against the endpoint serving the primary model. */
+function primaryKeyPool(): string[] {
+  const pool = LLM_PROVIDERS.filter((p) => p.baseURL === env.DEEPSEEK_BASE_URL).map(
+    (p) => p.apiKey,
+  );
+  return pool.length > 0 ? pool : splitKeys(env.DEEPSEEK_API_KEY);
+}
+
+/**
+ * The key for this call, advancing the rotation.
+ *
+ * Advances per model call rather than per request, so the several calls one
+ * agent turn makes are themselves spread across keys instead of concentrating
+ * a whole run's burst on one.
+ */
+function nextPrimaryKey(): string {
+  const pool = primaryKeyPool();
+  if (pool.length === 0) return env.DEEPSEEK_API_KEY ?? "";
+  lastPrimaryKey = pool[keyCursor++ % pool.length];
+  return lastPrimaryKey;
+}
+
+/** How many keys currently back the primary provider. Reported by /api/health. */
+export function primaryKeyCount(): number {
+  return primaryKeyPool().length;
+}
+
 export function getModel(tier: ModelTier = "pro", options: ModelOptions = {}): BaseChatModel {
   const temperature = options.temperature ?? (tier === "fast" ? 0 : 0.1);
 
   if (features.deepseek) {
     return new ChatDeepSeek({
       model: tier === "pro" ? MODEL_TIERS.PRO : MODEL_TIERS.FAST,
-      apiKey: env.DEEPSEEK_API_KEY,
+      apiKey: nextPrimaryKey(),
       temperature,
       maxTokens: options.maxTokens,
       configuration: { baseURL: env.DEEPSEEK_BASE_URL },
@@ -165,9 +210,12 @@ export function providerModel(
  * deliberately excluded — see ModelOptions.allowCohere.
  */
 export function getFallbackModels(tier: ModelTier = "pro"): BaseChatModel[] {
-  const primary = `${env.DEEPSEEK_BASE_URL}|${env.DEEPSEEK_API_KEY ?? ""}`;
+  // Exclude the key the rotation just handed out, not a fixed one. With keys
+  // rotating, a hardcoded exclusion would drop a healthy key from the chain
+  // while leaving in the very one that is about to fail.
+  const inUse = `${env.DEEPSEEK_BASE_URL}|${lastPrimaryKey || (env.DEEPSEEK_API_KEY ?? "")}`;
 
-  return LLM_PROVIDERS.filter((p) => `${p.baseURL}|${p.apiKey}` !== primary).map((p) =>
+  return LLM_PROVIDERS.filter((p) => `${p.baseURL}|${p.apiKey}` !== inUse).map((p) =>
     providerModel(p, tier, 0),
   );
 }

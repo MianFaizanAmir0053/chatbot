@@ -282,6 +282,25 @@ export async function POST(req: NextRequest) {
           const type = last?.getType?.();
 
           if (last?.tool_calls?.length) {
+            // Anything the model wrote before deciding to call a tool was a
+            // preamble, not the answer.
+            //
+            // Models narrate — "I'll first check your documents", "Since your
+            // documents don't cover this, I'll now search the web" — and every
+            // AI turn's text is streamed, so those announcements accumulate in
+            // front of the real answer. They are also pure noise here: the
+            // interface shows each search as it happens, so the commentary
+            // describes something the user is already watching.
+            //
+            // A tool call is the signal that what came before it was not the
+            // answer, and it is a reliable one: the model does not call a tool
+            // after it has finished answering. The prompt forbids narrating as
+            // well, but only this survives a model that narrates anyway.
+            if (answer.trim()) {
+              answer = "";
+              emit("revised_answer", { text: "" });
+            }
+
             for (const call of last.tool_calls) {
               // Middleware nodes re-emit the model's last message as their own
               // update, so one tool call arrives from model_request and again

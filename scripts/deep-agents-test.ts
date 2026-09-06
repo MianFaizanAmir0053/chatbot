@@ -217,6 +217,32 @@ function promptComposition() {
       delegating.includes("Never invent a citation number"),
   );
 
+  // Process narration reaches the user as part of the answer. Asked "what is
+  // Islam", the agent replied "To provide a comprehensive answer I'll first
+  // check if there are any relevant documents... Since your documents don't
+  // appear to contain information about Islam, I'll now search the web" — all
+  // of it describing searches the interface was already displaying.
+  check(
+    "both prompts forbid narrating the process",
+    direct.includes("Never narrate what you are about to do") &&
+      delegating.includes("Never narrate what you are about to do"),
+  );
+  check(
+    "but still require saying where facts came from",
+    direct.includes("Saying where a fact came from is not narration"),
+    "attribution is not narration",
+  );
+
+  // Asked "what is Islam" with the web tool available, the agent searched the
+  // documents, found nothing, and replied "Would you like me to perform a web
+  // search?" — handing the work back to the user, who asked precisely so they
+  // would not have to do it.
+  check(
+    "the prompt forbids asking permission to use its own tools",
+    direct.includes("Never ask permission to use a tool you already have") &&
+      direct.includes("Never end by offering to do something you could have just done"),
+  );
+
   // Breadth and few rounds have to be asked for together. Capping the rounds
   // stopped a supervisor that delegated four times and answered nothing, but on
   // its own it pushed the opposite way: a later turn delegated a single

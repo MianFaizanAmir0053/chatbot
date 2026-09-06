@@ -38,6 +38,9 @@ const EnvSchema = z.object({
   MISTRAL_API_KEY: z.string().optional(),
   MISTRAL_BASE_URL: z.string().default("https://api.mistral.ai/v1"),
 
+  TOGETHER_API_KEY: z.string().optional(),
+  TOGETHER_BASE_URL: z.string().default("https://api.together.ai/v1"),
+
   GEMINI_API_KEY: z.string().optional(),
   /**
    * Google's OpenAI-compatible surface, not the native generateContent API.
@@ -215,6 +218,15 @@ const PROVIDER_CATALOGUE: LlmProvider[] = [
     // visible text, so a small max_tokens comes back empty rather than short.
     pro: process.env.GEMINI_MODEL_PRO || "gemini-flash-latest",
     fast: process.env.GEMINI_MODEL_FAST || "gemini-flash-lite-latest",
+  },
+  {
+    name: "together",
+    apiKey: env.TOGETHER_API_KEY ?? "",
+    baseURL: env.TOGETHER_BASE_URL,
+    // gpt-oss is the same family groq serves, so a working Together account
+    // would be a like-for-like substitute rather than a quality step down.
+    pro: process.env.TOGETHER_MODEL_PRO || "openai/gpt-oss-120b",
+    fast: process.env.TOGETHER_MODEL_FAST || "openai/gpt-oss-20b",
   },
   {
     name: "bazaarlink",

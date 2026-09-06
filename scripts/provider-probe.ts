@@ -44,6 +44,13 @@ const PROVIDERS: Provider[] = [
     },
   },
   {
+    name: "together",
+    baseURL: "https://api.together.ai/v1",
+    apiKey: process.env.TOGETHER_API_KEY ?? "",
+    pro: "openai/gpt-oss-120b",
+    fast: "openai/gpt-oss-20b",
+  },
+  {
     name: "gemini",
     baseURL: "https://generativelanguage.googleapis.com/v1beta/openai",
     apiKey: process.env.GEMINI_API_KEY ?? "",

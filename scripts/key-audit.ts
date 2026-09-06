@@ -37,7 +37,22 @@ async function checkCohere(key: string): Promise<string> {
   }
 }
 
-async function checkChat(baseURL: string, key: string, model: string): Promise<string> {
+/**
+ * Statuses that say "try again", not "this key is bad".
+ *
+ * 429 is a rate limit and 503 is upstream overload; both are properties of the
+ * moment rather than the credential. Reporting either as a failure would
+ * condemn a working key and, worse, invite removing it from a pool that is
+ * there precisely to ride out these conditions.
+ */
+const TRANSIENT = new Set([429, 503, 502, 504]);
+
+async function checkChat(
+  baseURL: string,
+  key: string,
+  model: string,
+  attempt = 1,
+): Promise<string> {
   const started = Date.now();
   try {
     const res = await fetch(`${baseURL}/chat/completions`, {
@@ -52,6 +67,11 @@ async function checkChat(baseURL: string, key: string, model: string): Promise<s
     });
     const text = await res.text();
     if (!res.ok) {
+      if (TRANSIENT.has(res.status) && attempt === 1) {
+        await new Promise((r) => setTimeout(r, 15_000));
+        return checkChat(baseURL, key, model, 2);
+      }
+
       let detail = text.slice(0, 60);
       try {
         const j = JSON.parse(text);
@@ -59,7 +79,10 @@ async function checkChat(baseURL: string, key: string, model: string): Promise<s
       } catch {
         /* non-JSON body; the raw prefix is the best detail available */
       }
-      return `FAIL ${res.status} ${detail}`;
+      // Separate "busy" from "broken": the first needs patience, the second a
+      // new credential, and only the second should ever prompt removing a key.
+      const verdict = TRANSIENT.has(res.status) ? "BUSY" : "FAIL";
+      return `${verdict} ${res.status} ${detail.replace(/\s+/g, " ")}`;
     }
     return `OK   ${Date.now() - started}ms`;
   } catch (error) {
@@ -70,12 +93,18 @@ async function checkChat(baseURL: string, key: string, model: string): Promise<s
 async function main() {
   console.log("=== chat providers (one entry per key) ===");
   let chatOk = 0;
+  let chatBusy = 0;
   for (const [i, p] of LLM_PROVIDERS.entries()) {
     const status = await checkChat(p.baseURL, p.apiKey, p.pro);
     if (status.startsWith("OK")) chatOk++;
+    else if (status.startsWith("BUSY")) chatBusy++;
     console.log(`  ${String(i + 1).padStart(2)}. ${p.name.padEnd(12)} ${mask(p.apiKey)}  ${status}`);
   }
-  console.log(`  -> ${chatOk}/${LLM_PROVIDERS.length} usable\n`);
+  console.log(
+    `  -> ${chatOk}/${LLM_PROVIDERS.length} usable` +
+      (chatBusy > 0 ? `, ${chatBusy} temporarily busy (not a key problem)` : "") +
+      "\n",
+  );
 
   console.log("=== cohere (embeddings + rerank) ===");
   let cohereOk = 0;

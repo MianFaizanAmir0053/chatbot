@@ -284,7 +284,14 @@ export const LLM_PROVIDERS: LlmProvider[] = (() => {
     .map((s) => s.trim().toLowerCase())
     .filter(Boolean);
 
-  const usable = PROVIDER_CATALOGUE.filter((p) => p.apiKey);
+  // A provider's key field may hold several comma-separated keys. Each becomes
+  // its own entry against the same endpoint, so a 429 on one key falls to
+  // another key at the same provider before leaving for a slower one — the
+  // cheapest possible failover, and the one that matters most on the primary,
+  // where free-tier per-key limits are what actually bite.
+  const usable = PROVIDER_CATALOGUE.flatMap((p) =>
+    splitKeys(p.apiKey).map((apiKey) => ({ ...p, apiKey })),
+  );
 
   // When the order is given it is an allowlist, not just a ranking: a provider
   // is dropped by removing it from the list, without deleting its key. Appending
@@ -310,19 +317,27 @@ export const LLM_PROVIDERS: LlmProvider[] = (() => {
  * Callers rotate through these on a rate limit. Duplicates are dropped so a key
  * pasted twice does not make the retry budget look larger than it is.
  */
-export const COHERE_API_KEYS: string[] = [
-  ...new Set(
-    (env.COHERE_API_KEY ?? "")
-      .split(",")
-      // Strip surrounding quotes per key, not just around the whole value.
-      // A single quoted key is unwrapped by the env loader, but the moment a
-      // second is appended the value stops being one quoted string and the
-      // loader leaves the quotes in place — so the first key silently becomes
-      // `"abc` and every call with it returns 401.
-      .map((k) => k.trim().replace(/^["']|["']$/g, "").trim())
-      .filter(Boolean),
-  ),
-];
+/**
+ * Split a comma-separated credential value into individual keys.
+ *
+ * Quotes are stripped per key rather than around the whole value. A single
+ * quoted key is unwrapped by the env loader, but the moment a second is
+ * appended the value stops being one quoted string and the quotes survive — so
+ * the first key silently becomes `"abc` and every call with it returns 401
+ * while the rest quietly carry the load.
+ */
+export function splitKeys(raw: string | undefined): string[] {
+  return [
+    ...new Set(
+      (raw ?? "")
+        .split(",")
+        .map((k) => k.trim().replace(/^["']|["']$/g, "").trim())
+        .filter(Boolean),
+    ),
+  ];
+}
+
+export const COHERE_API_KEYS: string[] = splitKeys(env.COHERE_API_KEY);
 
 export const EMBEDDING_CONFIG = {
   model: "embed-v4.0",

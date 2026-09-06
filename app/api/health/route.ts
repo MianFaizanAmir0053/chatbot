@@ -44,8 +44,20 @@ export async function GET() {
       : features.openai
         ? "openai (fallback)"
         : "none",
-    /** Every gateway in the failover chain, primary first. */
-    chain: LLM_PROVIDERS.map((p) => p.name),
+    /**
+     * The failover chain, primary first, collapsed to one entry per gateway.
+     *
+     * A provider holding several keys contributes one chain entry per key, so
+     * listing them raw would repeat the same name eight times and read as a
+     * misconfiguration. The key count is the useful part: it is how many
+     * per-key rate limits that gateway can absorb before the chain moves on.
+     */
+    chain: [...new Set(LLM_PROVIDERS.map((p) => p.name))].map((name) => {
+      const keys = LLM_PROVIDERS.filter((p) => p.name === name).length;
+      return keys > 1 ? `${name} (${keys} keys)` : name;
+    }),
+    /** Total entries actually tried, which is what bounds failover depth. */
+    chainDepth: LLM_PROVIDERS.length,
     pro: activeModelId("pro"),
     fast: activeModelId("fast"),
     configuredTiers: MODEL_TIERS,

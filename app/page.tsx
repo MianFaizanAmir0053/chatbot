@@ -504,7 +504,14 @@ export default function ChatPage() {
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: text, history, threadId, mode: "agentic" }),
+        // Omit threadId entirely on the first message rather than sending null:
+        // "absent" is what the server means by a new conversation.
+        body: JSON.stringify({
+          message: text,
+          history,
+          ...(threadId ? { threadId } : {}),
+          mode: "agentic",
+        }),
         signal: controller.signal,
       });
 

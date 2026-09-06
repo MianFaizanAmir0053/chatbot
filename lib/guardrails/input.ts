@@ -126,7 +126,15 @@ export const ChatRequestSchema = z.object({
     .array(z.object({ name: z.string(), key: z.string(), type: z.string() }))
     .max(10)
     .default([]),
-  threadId: z.string().optional(),
+  /**
+   * Accepts null as well as absent.
+   *
+   * A client holding "no thread yet" in nullable state serialises it as null,
+   * which is a correct way to say the same thing — rejecting it turned the
+   * first message of every new conversation into a 400 while every subsequent
+   * one worked, since only then is the field a string.
+   */
+  threadId: z.string().nullish(),
   mode: z.enum(["agentic", "fast"]).default("agentic"),
 });
 

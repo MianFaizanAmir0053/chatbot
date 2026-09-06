@@ -38,6 +38,9 @@ const EnvSchema = z.object({
   MISTRAL_API_KEY: z.string().optional(),
   MISTRAL_BASE_URL: z.string().default("https://api.mistral.ai/v1"),
 
+  HUGGINGFACE_API_KEY: z.string().optional(),
+  HUGGINGFACE_BASE_URL: z.string().default("https://router.huggingface.co/v1"),
+
   TOGETHER_API_KEY: z.string().optional(),
   TOGETHER_BASE_URL: z.string().default("https://api.together.ai/v1"),
 
@@ -226,6 +229,17 @@ const PROVIDER_CATALOGUE: LlmProvider[] = [
     // visible text, so a small max_tokens comes back empty rather than short.
     pro: process.env.GEMINI_MODEL_PRO || "gemini-flash-latest",
     fast: process.env.GEMINI_MODEL_FAST || "gemini-flash-lite-latest",
+  },
+  {
+    name: "huggingface",
+    apiKey: env.HUGGINGFACE_API_KEY ?? "",
+    baseURL: env.HUGGINGFACE_BASE_URL,
+    // Tool support on the router is per model, not per account: the 8B Llama
+    // in HF's own example rejects a tools array outright with
+    // INVALID_REQUEST_BODY "model features", which would strand the agent loop.
+    // These three accept tools.
+    pro: process.env.HUGGINGFACE_MODEL_PRO || "deepseek-ai/DeepSeek-V3-0324",
+    fast: process.env.HUGGINGFACE_MODEL_FAST || "meta-llama/Llama-3.3-70B-Instruct",
   },
   {
     name: "together",

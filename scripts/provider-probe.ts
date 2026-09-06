@@ -44,6 +44,13 @@ const PROVIDERS: Provider[] = [
     },
   },
   {
+    name: "huggingface",
+    baseURL: "https://router.huggingface.co/v1",
+    apiKey: process.env.HUGGINGFACE_API_KEY ?? "",
+    pro: "deepseek-ai/DeepSeek-V3-0324",
+    fast: "meta-llama/Llama-3.3-70B-Instruct",
+  },
+  {
     name: "together",
     baseURL: "https://api.together.ai/v1",
     apiKey: process.env.TOGETHER_API_KEY ?? "",

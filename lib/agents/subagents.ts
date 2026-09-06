@@ -10,6 +10,7 @@ import { HumanMessage } from "@langchain/core/messages";
 import { setMaxListeners } from "events";
 import { z } from "zod";
 import { SUBAGENT_CONFIG } from "../config";
+import { normaliseCitations } from "../guardrails/output";
 import { getSubagentFallbackModels, getSubagentModel } from "../models";
 import { buildTools, type EvidenceCollector } from "./tools";
 
@@ -79,6 +80,10 @@ marker.
 
 ## Citation rules
 
+- Write a citation as **\`[7]\`** — a number in square brackets, nothing else
+  inside them. Not \`【7†L1-L2】\`, not \`[7†source]\`, not \`[7, lines 1-2]\`.
+  Do not add line ranges, file names or any other annotation inside the
+  brackets; put that in your prose if it matters.
 - Excerpt numbers from \`search_documents\` are stable for the entire
   conversation turn and shared with every other researcher working on this
   question. Reuse them exactly as given. Never renumber, never invent one.
@@ -375,8 +380,52 @@ export function buildDelegationTool(
               .map((b) => b.text)
               .join("") ?? "";
 
+      // A branch whose model calls were exhausted returns normally, and the
+      // retry middleware's own message becomes its "finding".
+      //
+      // `modelRetryMiddleware` runs with onFailure "continue", so a branch that
+      // never reached a model still resolves successfully, carrying text like
+      // "Model call failed after 4 attempts with ... 429 Daily token limit
+      // exceeded". Passed on unchanged, the supervisor reads that as research:
+      // a measured turn synthesised an answer explaining the rate limits to the
+      // user as though that were the finding, while every evidence check
+      // reported zero passages and no citations.
+      //
+      // Labelling it a failure keeps the distinction the whole design rests on
+      // — between the documents being silent and the infrastructure being
+      // unavailable — which the supervisor cannot otherwise tell apart.
+      if (/^Model call failed after \d+ attempts/.test(text.trim())) {
+        done("EXHAUSTED");
+        console.warn(`[delegate] ${researcher} exhausted its retries`);
+        return (
+          `${label}\nFAILED — the model provider refused every attempt ` +
+          `(${text.replace(/\s+/g, " ").slice(0, 160)}).\n` +
+          `This sub-question was NOT researched. Do not treat this as evidence, and do not ` +
+          `conclude the documents are silent on it — say plainly that it could not be checked.`
+        );
+      }
+
       done("ok");
-      return `${label}\n${text.trim() || "(the researcher returned nothing)"}`;
+
+      // Repair the finding's citation markers before the supervisor ever sees
+      // them.
+      //
+      // Researchers reliably invent an annotated marker format — measured
+      // output cited passages as `【2†L1-L2】` rather than `[2]` — and the
+      // damage compounds through delegation rather than staying local. The
+      // supervisor is told to reuse a finding's markers verbatim, so it
+      // faithfully copies a broken one, or gives up and cites nothing; either
+      // way the answer reaches validation with no recognisable citations and is
+      // pronounced valid, because a marker in an unknown shape is not seen as
+      // invalid, it is not seen at all. Two consecutive delegating turns
+      // produced answers with no citations for exactly this reason.
+      //
+      // Repairing here rather than only on the final answer means the
+      // supervisor synthesises from clean markers, which is also what its own
+      // instructions assume.
+      return `${label}\n${
+        normaliseCitations(text).trim() || "(the researcher returned nothing)"
+      }`;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       done("FAILED");

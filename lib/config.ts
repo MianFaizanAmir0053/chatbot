@@ -38,6 +38,16 @@ const EnvSchema = z.object({
   MISTRAL_API_KEY: z.string().optional(),
   MISTRAL_BASE_URL: z.string().default("https://api.mistral.ai/v1"),
 
+  GEMINI_API_KEY: z.string().optional(),
+  /**
+   * Google's OpenAI-compatible surface, not the native generateContent API.
+   *
+   * The native endpoint takes an X-goog-api-key header and a `contents` body
+   * that this registry cannot speak; this path accepts a Bearer token and the
+   * standard chat-completions shape, so Gemini needs no special-casing.
+   */
+  GEMINI_BASE_URL: z.string().default("https://generativelanguage.googleapis.com/v1beta/openai"),
+
   OPENROUTER_API_KEY: z.string().optional(),
   OPENROUTER_BASE_URL: z.string().default("https://openrouter.ai/api/v1"),
   /** Attribution shown on OpenRouter's app leaderboard. */
@@ -195,6 +205,16 @@ const PROVIDER_CATALOGUE: LlmProvider[] = [
     // reliably and still support tool calling, which the agent loop requires.
     pro: process.env.MISTRAL_MODEL_PRO || "ministral-14b-latest",
     fast: process.env.MISTRAL_MODEL_FAST || "ministral-8b-latest",
+  },
+  {
+    name: "gemini",
+    apiKey: env.GEMINI_API_KEY ?? "",
+    baseURL: env.GEMINI_BASE_URL,
+    // The flash line, not gemini-pro-latest: pro returns 429 on this key's
+    // quota. Note that flash spends its budget on thinking tokens before any
+    // visible text, so a small max_tokens comes back empty rather than short.
+    pro: process.env.GEMINI_MODEL_PRO || "gemini-flash-latest",
+    fast: process.env.GEMINI_MODEL_FAST || "gemini-flash-lite-latest",
   },
   {
     name: "bazaarlink",

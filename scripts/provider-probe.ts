@@ -44,6 +44,13 @@ const PROVIDERS: Provider[] = [
     },
   },
   {
+    name: "gemini",
+    baseURL: "https://generativelanguage.googleapis.com/v1beta/openai",
+    apiKey: process.env.GEMINI_API_KEY ?? "",
+    pro: "gemini-flash-latest",
+    fast: "gemini-flash-lite-latest",
+  },
+  {
     name: "mistral",
     baseURL: "https://api.mistral.ai/v1",
     apiKey: process.env.MISTRAL_API_KEY ?? "",

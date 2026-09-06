@@ -10,6 +10,7 @@ import {
   FALLBACK_MODELS,
   LLM_PROVIDERS,
   MODEL_TIERS,
+  SUBAGENT_PROVIDERS,
   splitKeys,
   type LlmProvider,
   env,
@@ -136,6 +137,70 @@ export function getModel(tier: ModelTier = "pro", options: ModelOptions = {}): B
 /** Model for auxiliary single-shot calls, where Cohere is a viable last resort. */
 export function getAuxModel(tier: ModelTier = "fast", options: ModelOptions = {}): BaseChatModel {
   return getModel(tier, { ...options, allowCohere: true });
+}
+
+/* ------------------------------------------------------------------ *
+ * Delegated research (Deep Agents)
+ * ------------------------------------------------------------------ */
+
+/**
+ * Rotation cursor for subagent credentials, separate from the primary one.
+ *
+ * Separate because the two pools differ in size and in what advancing them
+ * means. Sharing a cursor across pools of different lengths makes the stride
+ * uneven and can hand the same key to two subagents in the same fan-out, which
+ * is the one thing this rotation exists to prevent: concurrent branches must
+ * land on different credentials or they collide on a single key's per-minute
+ * limit and the fan-out is slower than running them one at a time.
+ */
+let subagentCursor = 0;
+
+/**
+ * A model for one research subagent, advancing the rotation.
+ *
+ * Called once per subagent construction rather than once per run, so a fan-out
+ * of four draws four different keys and the branches genuinely run in parallel
+ * instead of queueing behind one key's rate limit.
+ */
+export function getSubagentModel(tier: ModelTier = "pro", temperature = 0.1): BaseChatModel {
+  const pool = SUBAGENT_PROVIDERS;
+  if (pool.length === 0) return getModel(tier, { temperature });
+
+  const provider = pool[subagentCursor++ % pool.length];
+  return providerModel(provider, tier, temperature);
+}
+
+/**
+ * Fallback chain for a subagent, drawn only from the reliable pool.
+ *
+ * Deliberately not `getFallbackModels`: that chain ends at the gateways kept
+ * around to keep a single request alive when everything better is exhausted,
+ * and inheriting it here would let one branch fail over onto a provider that
+ * cannot sustain a research loop — stranding that branch while the supervisor
+ * waits for it and reports a gap that was an infrastructure failure, not an
+ * absence in the documents.
+ */
+export function getSubagentFallbackModels(tier: ModelTier = "pro"): BaseChatModel[] {
+  const pool = SUBAGENT_PROVIDERS;
+  if (pool.length <= 1) return [];
+
+  // Start after the entry the rotation just handed out, so the first fallback
+  // is a different credential rather than the one that has just failed.
+  const start = subagentCursor % pool.length;
+  return pool
+    .map((_, i) => pool[(start + i) % pool.length])
+    .slice(1)
+    .map((p) => providerModel(p, tier, 0));
+}
+
+/** Distinct provider names backing delegated research. Reported by /api/health. */
+export function subagentProviderNames(): string[] {
+  return [...new Set(SUBAGENT_PROVIDERS.map((p) => p.name))];
+}
+
+/** How many credentials the subagent rotation can draw on. */
+export function subagentKeyCount(): number {
+  return SUBAGENT_PROVIDERS.length;
 }
 
 /**

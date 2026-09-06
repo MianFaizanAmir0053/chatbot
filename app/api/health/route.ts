@@ -1,7 +1,21 @@
 import { NextResponse } from "next/server";
 import { activeSearchProvider } from "@/lib/agents/websearch";
-import { COHERE_API_KEYS, LLM_PROVIDERS, MODEL_TIERS, RERANK_CONFIG, env, features } from "@/lib/config";
-import { activeModelId, activeProviderName, primaryKeyCount } from "@/lib/models";
+import {
+  COHERE_API_KEYS,
+  LLM_PROVIDERS,
+  MODEL_TIERS,
+  RERANK_CONFIG,
+  SUBAGENT_CONFIG,
+  env,
+  features,
+} from "@/lib/config";
+import {
+  activeModelId,
+  activeProviderName,
+  primaryKeyCount,
+  subagentKeyCount,
+  subagentProviderNames,
+} from "@/lib/models";
 import { sparseIndexStats } from "@/lib/retrieval/hybrid";
 import { s3Healthy } from "@/lib/s3";
 import { getVectorStore } from "@/lib/vectorstore";
@@ -109,6 +123,23 @@ export async function GET() {
 
   checks.observability = {
     langsmith: features.tracing ? env.LANGSMITH_PROJECT : "disabled",
+  };
+
+  // Delegated research runs on a deliberately narrower provider set than the
+  // main chain, so reporting the main chain here would misdescribe it — and the
+  // per-branch ceilings are the only thing bounding spend inside a subagent,
+  // which makes them worth being able to read without the source.
+  checks.delegation = {
+    providers: subagentProviderNames(),
+    keys: subagentKeyCount(),
+    branchesPerRound: SUBAGENT_CONFIG.MAX_BRANCHES_PER_ROUND,
+    maxRounds: SUBAGENT_CONFIG.MAX_DELEGATION_ROUNDS,
+    maxBranches:
+      SUBAGENT_CONFIG.MAX_BRANCHES_PER_ROUND * SUBAGENT_CONFIG.MAX_DELEGATION_ROUNDS,
+    // One budget for the turn, supervisor and branches together — the limiter's
+    // tally lives in shared state, so it counts both.
+    turnModelCalls: SUBAGENT_CONFIG.TURN_MODEL_CALLS,
+    turnToolCalls: SUBAGENT_CONFIG.TURN_TOOL_CALLS,
   };
 
   // Everything needed to answer a question about an already-indexed document.

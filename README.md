@@ -21,6 +21,8 @@ reasoning loop, verifies its own answers against the sources, and cites every cl
 │    ├── plans           write_todos for genuinely multi-step questions     │
 │    ├── acts            search_documents · web_search · fetch_url ·        │
 │    │                   list_documents · calculator                        │
+│    ├── delegates       delegate_research → document-researcher ·          │
+│    │  (Deep Agents)    web-researcher · verifier, concurrently             │
 │    └── iterates        re-search on weak results, escalate to web         │
 │         ↓                                                                │
 │  MIDDLEWARE HARNESS    budget ceilings · retries · provider fallback ·    │
@@ -164,6 +166,8 @@ npm run verify        # typecheck + lint + smoke + wiring
 npm run smoke         # retrieval & guardrail pipeline, real API calls
 npm run test:wiring   # agent graph, middleware and tools (no model quota needed)
 npm run test:agent    # live agent behaviour (needs DEEPSEEK_API_KEY or OPENAI_API_KEY)
+npm run test:agents   # Deep Agents wiring: citations, prompt, tools (no quota needed)
+npm run test:agents:live  # + a real delegating turn and a concurrency measurement
 npm run qdrant:up     # start Qdrant in Docker
 npm run qdrant:down   # remove the Qdrant container
 ```
@@ -177,6 +181,10 @@ npm run qdrant:down   # remove the Qdrant container
   genuinely survive in Qdrant rather than living in process memory.
 - **`test:agent`** asks the live agent real questions and asserts it retrieves, decomposes
   multi-step questions, and refuses rather than fabricating when information is absent.
+- **`test:agents`** covers delegated research. Its checks target failures that are silent rather
+  than loud: citation markers that resolve to the wrong passage, a system prompt that instructs the
+  supervisor to search *and* to delegate, retrieval tools left bound to a supervisor that is
+  supposed to delegate, and — with `--live` — a fan-out that has quietly become sequential.
 
 ## Troubleshooting
 
@@ -211,6 +219,8 @@ npm run qdrant:down   # remove the Qdrant container
 | `status` | `{ stage }` — ingesting / thinking / verifying |
 | `todos` | `{ todos }` — the live plan, as the agent writes and revises it |
 | `tool_call` | `{ name, args }` |
+| `delegation` | `{ id, agent, task }` — one research branch of a batch started |
+| `delegation_result` | `{ batchId, chars }` — every branch in that batch reported |
 | `token` | `{ text }` — streamed answer text |
 | `sources` | `{ documents, web, searches }` |
 | `groundedness` | `{ score, verdict, passed, unsupportedClaims }` |

@@ -17,6 +17,7 @@ import {
   SearchIcon,
   SendIcon,
   ShieldIcon,
+  NetworkIcon,
   SparkIcon,
   StopIcon,
   UploadIcon,
@@ -39,6 +40,27 @@ type SourceDoc = {
 
 type TraceEntry = { kind: "status" | "tool" | "warning"; label: string; detail?: string };
 
+/**
+ * One delegated research branch.
+ *
+ * Tracked separately from the trace rather than as another trace line because a
+ * delegation is the only step that is still running while later steps appear.
+ * Several start at once and finish out of order, so they need a live per-branch
+ * state; a trace is an append-only log and cannot show that.
+ */
+type Delegation = {
+  id: string;
+  agent: string;
+  task: string;
+  done: boolean;
+};
+
+const AGENT_LABELS: Record<string, string> = {
+  "document-researcher": "Documents",
+  "web-researcher": "Web",
+  verifier: "Verifying",
+};
+
 type Groundedness = {
   score: number;
   verdict: "grounded" | "partially_grounded" | "unsupported";
@@ -51,6 +73,7 @@ type Message = {
   content: string;
   todos?: Todo[];
   trace?: TraceEntry[];
+  delegations?: Delegation[];
   sources?: SourceDoc[];
   web?: Array<{ title: string; url: string }>;
   groundedness?: Groundedness;
@@ -250,6 +273,68 @@ function TracePanel({ trace }: { trace: TraceEntry[] }) {
   );
 }
 
+/**
+ * Live view of the delegated research branches.
+ *
+ * Open by default while anything is still running and collapsed once every
+ * branch has reported, because its value is entirely in the waiting: delegated
+ * mode is the slowest setting, and a user who cannot see four researchers
+ * working in parallel just experiences a long unexplained pause. Afterwards the
+ * same information is only provenance, and the answer should have the space.
+ *
+ * Each row states the sub-question rather than the researcher's name alone —
+ * "Documents" three times says nothing, while the three sub-questions show
+ * exactly how the agent decomposed the problem, which is the part worth
+ * reading and the part worth catching when it is wrong.
+ */
+function DelegationPanel({ delegations }: { delegations: Delegation[] }) {
+  const running = delegations.filter((d) => !d.done).length;
+  const [open, setOpen] = useState(true);
+
+  if (delegations.length === 0) return null;
+
+  return (
+    <div className="mb-3">
+      <button
+        type="button"
+        onClick={() => setOpen(!open)}
+        aria-expanded={open}
+        className="inline-flex items-center gap-1.5 rounded-md px-1.5 py-1 -ml-1.5 text-[11px] font-medium text-ink-3 hover:bg-surface-hover hover:text-ink transition-colors"
+      >
+        <ChevronIcon
+          className={`w-3 h-3 transition-transform duration-200 ${open ? "rotate-90" : ""}`}
+        />
+        <NetworkIcon className="w-3.5 h-3.5" />
+        {delegations.length} researcher{delegations.length === 1 ? "" : "s"}
+        {running > 0 ? (
+          <span style={{ color: "var(--accent)" }}>· {running} running</span>
+        ) : (
+          <span className="text-ink-3">· all reported</span>
+        )}
+      </button>
+
+      {open && (
+        <ul className="mt-2 space-y-1.5 border-l border-line pl-3.5 ml-1 animate-fade-in">
+          {delegations.map((d) => (
+            <li key={d.id} className="relative text-[11px] leading-relaxed">
+              <span
+                className={`absolute -left-[18px] top-[5px] h-1.5 w-1.5 rounded-full ${
+                  d.done ? "" : "animate-pulse"
+                }`}
+                style={{ background: d.done ? "var(--ok, var(--line-strong))" : "var(--accent)" }}
+              />
+              <span className="text-ink-2 font-medium">
+                {AGENT_LABELS[d.agent] ?? d.agent}
+              </span>
+              {d.task && <span className="text-ink-3"> — {d.task}</span>}
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
 function GroundednessBadge({ g }: { g: Groundedness }) {
   // -1 signals the judge itself was unavailable; don't imply a verified result.
   if (g.score < 0) return null;
@@ -388,6 +473,7 @@ export default function ChatPage() {
   const [dragging, setDragging] = useState(false);
   const [webSearch, setWebSearch] = useState(true);
   const [deepThinking, setDeepThinking] = useState(false);
+  const [deepAgents, setDeepAgents] = useState(false);
 
   const endRef = useRef<HTMLDivElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -515,6 +601,7 @@ export default function ChatPage() {
           mode: "agentic",
           webSearch,
           thinking: deepThinking ? "deep" : "standard",
+          deepAgents,
         }),
         signal: controller.signal,
       });
@@ -584,6 +671,36 @@ export default function ChatPage() {
               }));
               break;
             }
+
+            case "delegation": {
+              const agent = String(data.agent ?? "researcher");
+              setStatus(`Researching in parallel · ${AGENT_LABELS[agent] ?? agent}`);
+              patch((m) => ({
+                ...m,
+                delegations: [
+                  ...(m.delegations ?? []),
+                  {
+                    id: String(data.id),
+                    agent,
+                    task: String(data.task ?? ""),
+                    done: false,
+                  },
+                ],
+              }));
+              break;
+            }
+
+            case "delegation_result":
+              // One batch resolves as a single tool result, so every branch it
+              // started finishes at the same moment. Branch ids are prefixed
+              // with the batch's own id, which is what pairs them up.
+              patch((m) => ({
+                ...m,
+                delegations: (m.delegations ?? []).map((d) =>
+                  d.id.startsWith(`${String(data.batchId)}:`) ? { ...d, done: true } : d,
+                ),
+              }));
+              break;
 
             case "token":
               patch((m) => ({ ...m, content: m.content + String(data.text ?? "") }));
@@ -711,6 +828,9 @@ export default function ChatPage() {
                       <div className="min-w-0 flex-1">
                         <div className="rounded-2xl rounded-tl-md border border-line bg-surface px-4 py-3.5 shadow-xs">
                           {m.todos && m.todos.length > 0 && <PlanPanel todos={m.todos} />}
+                          {m.delegations && m.delegations.length > 0 && (
+                            <DelegationPanel delegations={m.delegations} />
+                          )}
                           {m.trace && m.trace.length > 0 && <TracePanel trace={m.trace} />}
 
                           {m.content ? (
@@ -829,6 +949,17 @@ export default function ChatPage() {
                 deepThinking
                   ? "Decomposes the question, probes each part separately, searches for contradicting evidence, and reports coverage gaps. Slower and more thorough."
                   : "Standard depth — fastest, and enough for most single-fact questions"
+              }
+            />
+            <ModeToggle
+              active={deepAgents}
+              onClick={() => setDeepAgents(!deepAgents)}
+              icon={<NetworkIcon className="w-3.5 h-3.5" />}
+              label="Deep agents"
+              title={
+                deepAgents
+                  ? "Splits the question and hands each part to a specialist researcher with its own context, running them in parallel, then verifies the load-bearing claims before answering. The most thorough setting."
+                  : "Single researcher — one context does all the work"
               }
             />
             <span className="ml-auto hidden text-[11px] text-ink-3 sm:inline">

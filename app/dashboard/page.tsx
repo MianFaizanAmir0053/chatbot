@@ -27,6 +27,7 @@ import {
   DocumentIcon,
   GlobeIcon,
   LayersIcon,
+  NetworkIcon,
   RefreshIcon,
   SearchIcon,
   ShieldIcon,
@@ -82,6 +83,15 @@ type Health = {
     tools?: { webSearch?: string; tavilyConfigured?: boolean };
     guardrails?: Record<string, string | boolean>;
     observability?: { langsmith?: string };
+    delegation?: {
+      providers?: string[];
+      keys?: number;
+      branchesPerRound?: number;
+      maxRounds?: number;
+      maxBranches?: number;
+      turnModelCalls?: number;
+      turnToolCalls?: number;
+    };
   };
 };
 
@@ -349,6 +359,52 @@ export default function DashboardPage() {
                   {checks.models?.note && (
                     <Note tone="warn">{checks.models.note}</Note>
                   )}
+                </Card>
+
+                <Card>
+                  <CardHeader
+                    icon={<NetworkIcon className="w-4 h-4" />}
+                    title="Delegated research"
+                    subtitle="Specialist subagents, isolated contexts"
+                    action={
+                      <StatusPill ok={(checks.delegation?.providers?.length ?? 0) > 0} />
+                    }
+                  />
+                  <Row label="Researchers">
+                    Documents · Web · Verifier
+                  </Row>
+                  <Row label="Parallel branches per round">
+                    {checks.delegation?.branchesPerRound ?? "—"}
+                  </Row>
+                  <Row label="Delegation rounds per turn">
+                    {checks.delegation?.maxRounds ?? "—"}
+                  </Row>
+                  {/* Ceilings for the whole turn, supervisor and branches
+                      together: the limiters keep their tally in shared agent
+                      state, so they count a researcher's calls as well. */}
+                  <Row label="Model calls per turn">
+                    {checks.delegation?.turnModelCalls ?? "—"}
+                  </Row>
+                  <Row label="Tool calls per turn">
+                    {checks.delegation?.turnToolCalls ?? "—"}
+                  </Row>
+                  {(checks.delegation?.providers?.length ?? 0) > 0 && (
+                    <div className="flex items-center justify-between gap-3 py-2">
+                      <span className="shrink-0 text-xs text-ink-3">Branch providers</span>
+                      <div className="flex flex-wrap items-center justify-end gap-1">
+                        {checks.delegation?.providers?.map((name) => (
+                          <Pill key={name} tone="neutral">
+                            {name}
+                          </Pill>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  <Note tone="neutral">
+                    Branches run on a narrower provider set than the main chain — a gateway kept
+                    as a last resort for single requests would set the latency of an entire
+                    fan-out.
+                  </Note>
                 </Card>
 
                 <Card>

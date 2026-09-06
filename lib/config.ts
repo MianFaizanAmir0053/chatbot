@@ -87,6 +87,21 @@ const EnvSchema = z.object({
   LLM_PROVIDER_ORDER: z.string().optional(),
 
   /**
+   * Providers a research subagent is allowed to run on.
+   *
+   * A narrower allowlist than LLM_PROVIDER_ORDER, and narrower on purpose. The
+   * tail of the main chain exists to keep a single request alive when
+   * everything better is rate-limited, and a slow-but-alive gateway is the right
+   * answer there. It is the wrong answer for a fan-out: several subagents run
+   * concurrently and the supervisor cannot synthesise until the slowest returns,
+   * so one degraded provider sets the latency of the whole turn, and a provider
+   * that answers without calling tools strands its branch entirely.
+   *
+   * Defaults to the providers measured as sustaining tool calls under load.
+   */
+  SUBAGENT_PROVIDER_ORDER: z.string().optional(),
+
+  /**
    * Embeddings and reranking. Accepts a comma-separated list of keys.
    *
    * Cohere is the one hard single point of failure here: it is the only source
@@ -383,6 +398,31 @@ export const LLM_PROVIDERS: LlmProvider[] = (() => {
 })();
 
 /**
+ * Providers judged reliable enough to run a delegated research branch.
+ *
+ * These are the gateways that passed the whole assessment ladder — a real tool
+ * call, then five sustained under load, then a complete agent turn — not merely
+ * the ones that returned a completion once. The distinction is what this list
+ * is for: a gateway that answers three calls and then returns 402, or that
+ * accepts a tools array and replies in prose without using it, looks healthy to
+ * a connectivity check and silently produces an empty branch here.
+ *
+ * Falls back to the head of the main chain when nothing is configured and
+ * nothing matches, so a renamed or removed provider degrades to "the best
+ * available" rather than to an empty list, which would leave subagents with no
+ * model at all.
+ */
+export const SUBAGENT_PROVIDERS: LlmProvider[] = (() => {
+  const requested = (env.SUBAGENT_PROVIDER_ORDER ?? "groq,gemini,aionlabs")
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+
+  const matched = requested.flatMap((name) => LLM_PROVIDERS.filter((p) => p.name === name));
+  return matched.length > 0 ? matched : LLM_PROVIDERS.slice(0, 8);
+})();
+
+/**
  * Every configured Cohere key, in order.
  *
  * Callers rotate through these on a rate limit. Duplicates are dropped so a key
@@ -485,6 +525,27 @@ export const RETRIEVAL_PROFILES = {
     FINAL_TOP_K: 14,
     FUSION_TOP_K: 80,
   },
+  /**
+   * The profile a research subagent retrieves with.
+   *
+   * Query expansion is skipped entirely for this profile — `search_documents`
+   * passes `expand: false` — so `QUERY_VARIANTS` and `MAX_QUERIES` are inert
+   * here and kept only so the profile shape stays uniform. Expansion exists so
+   * that a lone agent can attack a question from several angles; a supervisor
+   * that has decomposed the question has already done that at a higher level,
+   * and each branch re-deriving its own angles repeats the work — onto Cohere,
+   * the one dependency a fan-out cannot spread across keys.
+   *
+   * The top-k figures do apply, and are a little richer than `standard`: a
+   * branch has one job and a clean context, so it can afford to read a couple
+   * more passages than a supervisor juggling the whole question.
+   */
+  focused: {
+    QUERY_VARIANTS: 2,
+    MAX_QUERIES: 3,
+    FINAL_TOP_K: 8,
+    FUSION_TOP_K: 50,
+  },
 } as const;
 
 export type ThinkingMode = keyof typeof RETRIEVAL_PROFILES;
@@ -519,6 +580,122 @@ export const GUARDRAIL_CONFIG = {
   MIN_GROUNDEDNESS: 0.5,
   RATE_LIMIT_WINDOW_MS: 60_000,
   RATE_LIMIT_MAX_REQUESTS: 20,
+} as const;
+
+/**
+ * Budgets for delegated research (Deep Agents mode).
+ *
+ * The obvious design — a ceiling on the supervisor plus a ceiling inside each
+ * subagent — does not work, and fails in the worst possible way. The limit
+ * middlewares keep their tallies in agent *state*, and a subagent inherits the
+ * parent's state, so a branch begins counting from whatever the supervisor has
+ * already spent. Measured with a per-branch limit of six, every delegation
+ * returned "run level call limit reached with 6 model calls" before its
+ * researcher made a single call of its own, and the supervisor concluded the
+ * documents did not contain the answer. Nothing errored.
+ *
+ * So the budgets here are per *turn*, enforced once on the supervisor and
+ * counting the branches too through that same shared state. A branch is bounded
+ * separately by `BRANCH_RECURSION_LIMIT`, which is passed in the config of its
+ * own invocation and therefore cannot be inherited.
+ *
+ * Worst case for a delegating turn is TURN_MODEL_CALLS model calls and
+ * TURN_TOOL_CALLS tool calls across the supervisor and every researcher, with
+ * at most MAX_BRANCHES_PER_ROUND * MAX_DELEGATION_ROUNDS branches ever started.
+ */
+export const SUBAGENT_CONFIG = {
+  /**
+   * Researchers one `delegate_research` call may start, running concurrently.
+   *
+   * Also the fan-out width the supervisor is asked to aim for, and the cap the
+   * tool enforces on the array it receives — a model that ignores the schema
+   * and sends twenty sub-questions gets the first six researched rather than
+   * twenty subagents.
+   */
+  MAX_BRANCHES_PER_ROUND: 6,
+
+  /**
+   * How many times one turn may call `delegate_research`.
+   *
+   * Separate from the width because the two bound different things and
+   * conflating them understates the total badly: one number serving as both a
+   * per-call cap and a per-turn cap reads like a limit of six branches while
+   * actually permitting thirty-six. Three rounds is what the workflow asks for
+   * — the opening fan-out, a verification pass, and one round to close gaps —
+   * so the real ceiling is eighteen branches, and the turn's shared model-call
+   * budget binds well before that.
+   */
+  MAX_DELEGATION_ROUNDS: 3,
+
+  /**
+   * Model calls for a whole delegating turn — supervisor and branches together.
+   *
+   * One shared budget rather than a supervisor ceiling plus a per-branch
+   * ceiling, because the counters are shared whether or not that is wanted.
+   * `modelCallLimitMiddleware` keeps its tally in agent *state*, and a subagent
+   * inherits the parent's state, so a branch begins counting from whatever the
+   * supervisor has already spent.
+   *
+   * Giving branches their own limiter therefore does not bound them — it
+   * measures the supervisor's usage against the branch's allowance and refuses
+   * the delegation outright. Measured: with a per-branch limit of 6, every
+   * single `task` call returned "run level call limit reached with 6 model
+   * calls" before the researcher made even one call of its own, and the
+   * supervisor reported that it could not find the documents. The feature
+   * looked like it was running and produced nothing.
+   *
+   * The same sharing is what makes a single budget sufficient: the supervisor's
+   * limiter sees the branches' calls too, so this is a real ceiling on the
+   * whole turn rather than on the supervisor's share of it.
+   */
+  TURN_MODEL_CALLS: 45,
+
+  /**
+   * Tool calls for a whole delegating turn, for the same shared-counter reason.
+   *
+   * Has to be well above the non-delegating ceiling: every researcher's
+   * searches are counted here too, so six branches running three searches each
+   * is eighteen calls before the supervisor's own delegations are added. The
+   * ordinary limit of 25 would stop a fan-out partway and leave the supervisor
+   * synthesising from branches that never finished.
+   */
+  TURN_TOOL_CALLS: 60,
+
+  /**
+   * Graph steps one research branch may take.
+   *
+   * The only ceiling that actually binds a branch. It is passed in the config
+   * of the branch's own `invoke`, so unlike the limit middlewares — whose
+   * counters live in state a subagent inherits from its parent — it is scoped
+   * to that single call and cannot be pre-consumed by the supervisor.
+   *
+   * A researcher runs a much shorter middleware stack than the supervisor, so a
+   * model turn costs far fewer steps here; 60 is roughly six turns, which is
+   * ample for search, re-search and report, and stops a stalled branch well
+   * before it could exhaust the turn's shared model-call budget.
+   */
+  BRANCH_RECURSION_LIMIT: 60,
+
+  /**
+   * Full retrieval pipelines allowed to run at once, across all branches.
+   *
+   * Model calls parallelise across eight rotating provider keys; retrieval does
+   * not. Embeddings and reranking both go to Cohere, which is the one hard
+   * shared dependency in this system, and a fan-out multiplies the load on it by
+   * the width of the fan-out — each branch running query planning, a dense
+   * probe per variant and a rerank over the fused pool. Left unbounded, three
+   * concurrent researchers exhausted all eight Cohere keys in turn and the
+   * rotation spent its time failing over: the fan-out became *slower* than
+   * running the branches one at a time, which is the opposite of the point.
+   *
+   * Three keeps the branches genuinely overlapped on the model calls — where
+   * the latency actually is — while holding Cohere concurrency at a level the
+   * quota sustains. Retrieval queues briefly instead of stampeding.
+   */
+  RETRIEVAL_CONCURRENCY: 3,
+
+  /** Recommended fan-out width, stated in the prompt so delegations batch. */
+  TARGET_PARALLEL_WIDTH: 4,
 } as const;
 
 /** Which optional subsystems are actually usable with the current env. */

@@ -18,10 +18,52 @@ export interface EvidenceCollector {
   documents: RankedDocument[];
   webResults: Array<{ title: string; url: string }>;
   searches: string[];
+  /**
+   * Passage identity to the citation number it was given, for this run.
+   *
+   * The map is what makes a citation marker mean one thing. `documents` is
+   * append-only and a passage's ordinal is its position in it, so `[n]` always
+   * resolves to `documents[n - 1]` no matter which search — or which subagent —
+   * surfaced it.
+   */
+  ordinals: Map<string, number>;
 }
 
 export function createEvidenceCollector(): EvidenceCollector {
-  return { documents: [], webResults: [], searches: [] };
+  return { documents: [], webResults: [], searches: [], ordinals: new Map() };
+}
+
+/** Stable identity for a passage: the chunk it came from, not its text. */
+function passageKey(d: RankedDocument): string {
+  return `${d.doc.metadata?.source}#${d.doc.metadata?.chunkIndex}`;
+}
+
+/**
+ * Record retrieved passages and return the citation number of each.
+ *
+ * Assigns a run-global ordinal on first sight and returns the existing one
+ * afterwards, so the same passage retrieved by two different searches — or by
+ * two subagents working on neighbouring sub-questions, which is common — is
+ * cited by the same number in both places and stored once.
+ *
+ * Ordinals are positions in `documents`, which is what the API layer sends to
+ * the client as `sources` and what citation validation resolves against. Those
+ * three views agree by construction rather than by coincidence.
+ */
+export function registerEvidence(
+  collector: EvidenceCollector,
+  docs: RankedDocument[],
+): number[] {
+  return docs.map((d) => {
+    const key = passageKey(d);
+    const existing = collector.ordinals.get(key);
+    if (existing !== undefined) return existing;
+
+    collector.documents.push(d);
+    const ordinal = collector.documents.length;
+    collector.ordinals.set(key, ordinal);
+    return ordinal;
+  });
 }
 
 const NO_RESULTS =
@@ -36,12 +78,94 @@ export interface ToolOptions {
   webSearch?: boolean;
   /** Retrieval depth for search_documents. */
   mode?: ThinkingMode;
+  /**
+   * Shared cache of in-flight and completed tool results for the run.
+   *
+   * Sub-questions overlap: several branches will independently think to call
+   * `list_documents`, or to search the same obvious phrase, and without sharing
+   * each pays the full cost of a query another branch has already run — an
+   * embedding, a rerank against the Cohere quota, and a passage payload through
+   * that branch's context.
+   *
+   * A cache of promises rather than a shared counter, because branches run
+   * concurrently. Sharing the repeat-suppression counter looked equivalent and
+   * is not: it increments before the call resolves, so a second branch issuing
+   * the same query while the first is still fetching is told it has already
+   * made that call and must not repeat it — when it has never seen a result at
+   * all. Awaiting the same promise instead gives every branch the real
+   * passages while the work happens once.
+   */
+  resultCache?: Map<string, Promise<string>>;
+  /** Names the tool set in repeat-guard logs, so a noisy branch is identifiable. */
+  label?: string;
+  /**
+   * Build the tool set for a *delegating* supervisor: planning only, no retrieval.
+   *
+   * Withholding `search_documents` is what actually makes delegation happen, and
+   * it is not a matter of taste. A supervisor holding both `task` and
+   * `search_documents` has two routes to the same answer, one of which is
+   * immediate and cheap-looking, and models reliably take it: with the tools
+   * bound and a prompt explicitly instructing delegation, measured runs issued
+   * three direct searches and zero delegations, answered correctly, and gave no
+   * sign the feature had not engaged. Strengthening the prompt does not fix
+   * this dependably — and it would have to hold across every provider in the
+   * rotation, each of which weighs instructions differently.
+   *
+   * `list_documents` survives because it is how a supervisor learns what exists
+   * before deciding how to split the question, and it returns a short index
+   * rather than passages. `calculator` survives because arithmetic over
+   * findings is the supervisor's own job.
+   */
+  delegating?: boolean;
 }
 
 export function buildTools(collector: EvidenceCollector, options: ToolOptions = {}) {
-  const { webSearch: allowWeb = true, mode = "standard" } = options;
-  /** Per-run record of tool calls already made, keyed by name and arguments. */
+  const { webSearch: allowWeb = true, mode = "standard", label } = options;
+  /**
+   * Repeat count, per tool set.
+   *
+   * Deliberately not shared between branches: it exists to break a *single*
+   * agent's stall loop, and that judgement only makes sense against calls that
+   * agent has itself seen the results of.
+   */
   const callLog = new Map<string, number>();
+  const scope = label ?? "agent";
+
+  /**
+   * Bind a tool implementation to this run's guards.
+   *
+   * Two different problems, so two mechanisms. Within one tool set a repeated
+   * identical call means the agent is stalling, and the useful response is an
+   * instruction to stop rather than the payload it already holds. Across tool
+   * sets — concurrent research branches — the same call means two agents
+   * independently needed the same fact, and the useful response is the fact.
+   *
+   * The cache key is the tool name and arguments alone, with the scope carried
+   * only into the log line: including the scope would give every branch its own
+   * namespace and silently undo the sharing.
+   */
+  const guarded = <A>(name: string, run: (args: A) => Promise<string>) => {
+    const guardedRun = withRepeatGuard(name, callLog, run, scope);
+    const cache = options.resultCache;
+    if (!cache) return guardedRun;
+
+    return async (args: A) => {
+      const key = `${name}:${JSON.stringify(args ?? {})}`;
+      const existing = cache.get(key);
+      if (existing) return existing;
+
+      const pending = guardedRun(args);
+      cache.set(key, pending);
+      try {
+        return await pending;
+      } catch (error) {
+        // A failed call must not be cached, or every other branch inherits the
+        // failure and the whole fan-out fails on one transient error.
+        cache.delete(key);
+        throw error;
+      }
+    };
+  };
 
   /**
    * The primary RAG tool: hybrid retrieval + cross-encoder reranking.
@@ -51,27 +175,36 @@ export function buildTools(collector: EvidenceCollector, options: ToolOptions = 
    * search again. That loop is what separates agentic RAG from a fixed pipeline.
    */
   const searchDocuments = tool(
-    withRepeatGuard("search_documents", callLog, async ({ query, topK }: { query: string; topK?: number }) => {
-      const result = await retrieve(query, { topK, mode });
+    guarded("search_documents", async ({ query, topK }: { query: string; topK?: number }) => {
+      // Research branches skip query expansion, and this is the change that
+      // makes a fan-out actually faster rather than merely concurrent.
+      //
+      // Expansion exists so a lone agent can attack a question from several
+      // angles at once: paraphrases, extracted keywords, a HyDE probe. A
+      // supervisor that has decomposed the question has already done exactly
+      // that, at a higher level — so each branch re-deriving its own angles is
+      // the same work a second time, and it lands on Cohere, which is the one
+      // dependency a fan-out cannot spread. Measured with three concurrent
+      // branches expanding, all eight Cohere keys were exhausted in rotation
+      // and three parallel branches took as long per branch as running them
+      // one at a time.
+      //
+      // Dropping it removes a model call and roughly two thirds of the
+      // embedding calls per search, which is what turns the concurrency into
+      // wall-clock.
+      const result = await retrieve(query, { topK, mode, expand: mode !== "focused" });
       collector.searches.push(query);
 
       if (result.documents.length === 0) return NO_RESULTS;
 
-      // Deduplicate against evidence already gathered during this run.
-      const seen = new Set(
-        collector.documents.map((d) => `${d.doc.metadata?.source}#${d.doc.metadata?.chunkIndex}`),
-      );
-      for (const d of result.documents) {
-        const key = `${d.doc.metadata?.source}#${d.doc.metadata?.chunkIndex}`;
-        if (!seen.has(key)) {
-          collector.documents.push(d);
-          seen.add(key);
-        }
-      }
+      // Register first, then format with the numbers registration handed back,
+      // so the markers the model sees are the run-global ones it must cite.
+      const ordinals = registerEvidence(collector, result.documents);
 
       return (
         `Found ${result.documents.length} passages ` +
-        `(top relevance ${result.topScore.toFixed(3)}):\n\n${formatContext(result.documents)}`
+        `(top relevance ${result.topScore.toFixed(3)}):\n\n` +
+        formatContext(result.documents, ordinals)
       );
     }),
     {
@@ -80,7 +213,9 @@ export function buildTools(collector: EvidenceCollector, options: ToolOptions = 
         "Search the uploaded document knowledge base using hybrid semantic + keyword retrieval " +
         "with cross-encoder reranking. Use this FIRST for any question that could relate to the " +
         "user's documents. Returns numbered excerpts with source, section and page. " +
-        "Call it multiple times with different phrasings to cover distinct sub-questions.",
+        "Call it multiple times with different phrasings to cover distinct sub-questions. " +
+        "Excerpt numbers are stable for the whole turn — cite them exactly as given, and never " +
+        "renumber them.",
       schema: z.object({
         query: z.string().describe("A focused, self-contained search query"),
         topK: z.number().int().min(1).max(15).optional().describe("How many passages to return"),
@@ -89,7 +224,7 @@ export function buildTools(collector: EvidenceCollector, options: ToolOptions = 
   );
 
   const listDocuments = tool(
-    withRepeatGuard("list_documents", callLog, async () => {
+    guarded("list_documents", async () => {
       const status = await knowledgeBaseStatus();
       if (status.documents.length === 0) {
         return "The knowledge base is empty. No documents have been uploaded yet.";
@@ -110,7 +245,7 @@ export function buildTools(collector: EvidenceCollector, options: ToolOptions = 
   );
 
   const searchWeb = tool(
-    withRepeatGuard("web_search", callLog, async ({ query, maxResults }: { query: string; maxResults?: number }) => {
+    guarded("web_search", async ({ query, maxResults }: { query: string; maxResults?: number }) => {
       const outcome = await webSearch(query, maxResults ?? 5);
       collector.searches.push(`web: ${query}`);
 
@@ -144,7 +279,7 @@ export function buildTools(collector: EvidenceCollector, options: ToolOptions = 
   );
 
   const fetchUrl = tool(
-    withRepeatGuard("fetch_url", callLog, async ({ url }: { url: string }) => {
+    guarded("fetch_url", async ({ url }: { url: string }) => {
       let parsed: URL;
       try {
         parsed = new URL(url);
@@ -220,7 +355,12 @@ export function buildTools(collector: EvidenceCollector, options: ToolOptions = 
   );
 
   // Omitting the web tools rather than refusing inside them: a tool the model
-  // cannot see is one it cannot spend a turn discovering it may not use.
+  // cannot see is one it cannot spend a turn discovering it may not use. The
+  // same reasoning governs the delegating set — retrieval is not forbidden by
+  // instruction, it is simply absent, and the `task` tool is the only way to
+  // reach a document.
+  if (options.delegating) return [listDocuments, calculator];
+
   return allowWeb
     ? [searchDocuments, listDocuments, searchWeb, fetchUrl, calculator]
     : [searchDocuments, listDocuments, calculator];
@@ -253,6 +393,7 @@ function withRepeatGuard<A>(
   name: string,
   seen: Map<string, number>,
   run: (args: A) => Promise<string>,
+  scope = "agent",
 ): (args: A) => Promise<string> {
   return async (args: A) => {
     const key = `${name}:${JSON.stringify(args ?? {})}`;
@@ -260,7 +401,7 @@ function withRepeatGuard<A>(
     seen.set(key, count);
 
     if (count > 1) {
-      console.warn(`[tools] ${name} repeated (call ${count}) — answered without re-running`);
+      console.warn(`[tools/${scope}] ${name} repeated (call ${count}) — answered without re-running`);
       return (
         `You already called ${name} with these exact arguments ${count - 1} time(s) in this ` +
         `turn and the result has not changed. Do not repeat it. Either use genuinely different ` +

@@ -317,3 +317,23 @@ export function BrandMark({ className = "w-9 h-9" }: { className?: string }) {
     </svg>
   );
 }
+
+/**
+ * Delegation: one node fanning out to several.
+ *
+ * Chosen over a generic sparkle or brain because the toggle it labels changes
+ * the *shape* of the run rather than its effort — the question is split and
+ * researched in parallel contexts — and the branching is the part a user needs
+ * to recognise when they see several researchers running at once.
+ */
+export function NetworkIcon(p: IconProps) {
+  return (
+    <Svg {...p}>
+      <circle cx="12" cy="4.5" r="2.2" />
+      <circle cx="4.5" cy="19.5" r="2.2" />
+      <circle cx="12" cy="19.5" r="2.2" />
+      <circle cx="19.5" cy="19.5" r="2.2" />
+      <path d="M12 6.7v3.6M4.5 17.3v-1.6a2 2 0 0 1 2-2h11a2 2 0 0 1 2 2v1.6M12 13.7v3.6" />
+    </Svg>
+  );
+}

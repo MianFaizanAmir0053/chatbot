@@ -140,6 +140,15 @@ export const ChatRequestSchema = z.object({
   webSearch: z.boolean().default(true),
   /** Reasoning depth: retrieval breadth, iteration budget and prompt contract. */
   thinking: z.enum(["standard", "deep"]).default("standard"),
+  /**
+   * Delegate research to specialist subagents with isolated context windows.
+   *
+   * Orthogonal to `thinking`, not a third depth setting: depth governs how hard
+   * one context works a sub-question, delegation governs how many contexts the
+   * question is spread across. They compose, and the combination is the most
+   * thorough configuration available.
+   */
+  deepAgents: z.boolean().default(false),
 });
 
 export type ChatRequest = z.infer<typeof ChatRequestSchema>;

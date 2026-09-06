@@ -13,8 +13,9 @@ import {
   toolRetryMiddleware,
 } from "langchain";
 import { ChatOpenAI } from "@langchain/openai";
-import { FALLBACK_MODELS, GUARDRAIL_CONFIG, env, features } from "../config";
+import { FALLBACK_MODELS, GUARDRAIL_CONFIG, SUBAGENT_CONFIG, env, features } from "../config";
 import { getFallbackModels, getModel } from "../models";
+
 
 /**
  * The agent harness.
@@ -27,27 +28,73 @@ import { getFallbackModels, getModel } from "../models";
  * Order matters. Middleware wraps the model call from the outside in, so the
  * cheap deterministic guards sit outermost and the expensive ones run last.
  */
-export function buildMiddleware(options: { enableTodos?: boolean } = {}) {
-  const { enableTodos = true } = options;
+export interface MiddlewareOptions {
+  enableTodos?: boolean;
+  /**
+   * The run delegates research to subagents.
+   *
+   * Changes three things here and nothing else: the budgets become
+   * whole-turn budgets rather than supervisor-only ones, the tool limit gains a
+   * per-delegation ceiling, and delegated findings are protected from context
+   * clearing. The delegation tool itself is built in buildAgent, alongside the
+   * researchers' own tools, because it needs the run's evidence collector.
+   */
+  deepAgents?: boolean;
+}
+
+export function buildMiddleware(options: MiddlewareOptions = {}) {
+  const { enableTodos = true, deepAgents: delegating = false } = options;
   const middleware = [];
 
   /* --- Budget ceilings: hard stops on runaway loops (cheapest guard first) --- */
 
   middleware.push(
     modelCallLimitMiddleware({
-      runLimit: GUARDRAIL_CONFIG.MAX_MODEL_CALLS_PER_RUN,
+      // When delegating this is the budget for the entire turn, not the
+      // supervisor's share of it. The counter lives in agent state and subagents
+      // inherit that state, so this limiter sees the researchers' calls as well
+      // as the supervisor's — which makes it a real ceiling on the whole
+      // fan-out, and makes a separate per-branch ceiling both redundant and
+      // actively harmful (a branch would start counting from the supervisor's
+      // total and refuse itself before running).
+      runLimit: delegating
+        ? SUBAGENT_CONFIG.TURN_MODEL_CALLS
+        : GUARDRAIL_CONFIG.MAX_MODEL_CALLS_PER_RUN,
       // "end" lets the agent finish with what it has rather than throwing away
       // a partially-complete answer the user already waited for.
       exitBehavior: "end",
     }),
   );
 
+  // `end` stops the run on the call that exceeded the limit, and is documented
+  // to raise NotImplementedError when a message carries several tool calls.
+  // `continue` is the safer ceiling for a delegating turn: the calls over the
+  // limit come back as errors and the model decides how to finish, so a fan-out
+  // that overruns keeps the branches it did complete instead of losing them.
+  const toolExit = delegating ? "continue" : "end";
+
   middleware.push(
     toolCallLimitMiddleware({
-      runLimit: GUARDRAIL_CONFIG.MAX_TOOL_CALLS_PER_RUN,
-      exitBehavior: "end",
+      runLimit: delegating
+        ? SUBAGENT_CONFIG.TURN_TOOL_CALLS
+        : GUARDRAIL_CONFIG.MAX_TOOL_CALLS_PER_RUN,
+      exitBehavior: toolExit,
     }),
   );
+
+  // A per-tool ceiling on delegation itself. The run-wide tool limit above
+  // counts searches and delegations alike, so without this a supervisor could
+  // spend its whole tool budget fanning out — and one such call starts a whole
+  // batch of subagents rather than performing a single retrieval.
+  if (delegating) {
+    middleware.push(
+      toolCallLimitMiddleware({
+        toolName: "delegate_research",
+        runLimit: SUBAGENT_CONFIG.MAX_DELEGATION_ROUNDS,
+        exitBehavior: "continue",
+      }),
+    );
+  }
 
   /* --- Planning: multi-step decomposition into a visible todo list --- */
 
@@ -103,6 +150,16 @@ export function buildMiddleware(options: { enableTodos?: boolean } = {}) {
           trigger: { tokens: 60000 },
           keep: { messages: 4 },
           clearToolInputs: false,
+          // Never clear delegated findings. A `delegate_research` result is not
+          // a retrieval that can be re-run — it is the distilled output of a
+          // whole batch of subagents, and it is what the supervisor synthesises
+          // from. Clearing it discards every branch that produced it while
+          // leaving the run looking healthy: the supervisor writes a confident
+          // answer with the evidence for it deleted, which is the exact failure
+          // delegation was introduced to prevent. `write_todos` is excluded for
+          // the same reason at lower stakes — losing the plan mid-run makes the
+          // agent re-plan and repeat work it has already done.
+          excludeTools: ["delegate_research", "write_todos"],
         }),
       ],
     }),

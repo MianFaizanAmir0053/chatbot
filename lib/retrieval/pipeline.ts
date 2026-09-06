@@ -1,6 +1,6 @@
 import { HumanMessage, SystemMessage } from "@langchain/core/messages";
 import { z } from "zod";
-import { RETRIEVAL_PROFILES, type ThinkingMode } from "../config";
+import { RETRIEVAL_PROFILES, SUBAGENT_CONFIG, type ThinkingMode } from "../config";
 import { getAuxModels } from "../models";
 import { structuredInvoke } from "../structured";
 import { hybridSearch } from "./hybrid";
@@ -85,7 +85,22 @@ async function planQueries(
  * `originalText` is preferred so quotes never contain the synthetic context
  * header added at ingest time.
  */
-export function formatContext(docs: RankedDocument[]): string {
+/**
+ * Render passages as numbered, citable excerpts.
+ *
+ * `ordinals` supplies the citation number for each passage. Pass it whenever
+ * the numbers have to mean the same thing across more than one call, and let it
+ * default to positional numbering only for one-shot formatting.
+ *
+ * The distinction matters more than it looks. Numbering each call from 1 makes the
+ * second search's `[3]` a different passage from the first search's `[3]`, while
+ * citation validation resolves both against the run's accumulated evidence — so
+ * a marker that passes validation can still point at the wrong source, which is
+ * worse than a broken one because nothing reports it. Delegated research turns
+ * that from an edge case into the normal path: several subagents each retrieve
+ * and cite, and their findings are concatenated into one answer.
+ */
+export function formatContext(docs: RankedDocument[], ordinals?: number[]): string {
   return docs
     .map((d, i) => {
       const meta = d.doc.metadata ?? {};
@@ -93,7 +108,7 @@ export function formatContext(docs: RankedDocument[]): string {
       if (meta.section) parts.push(`section: ${meta.section}`);
       if (meta.page) parts.push(`page: ${meta.page}`);
       const body = String(meta.originalText ?? d.doc.pageContent).trim();
-      return `[${i + 1}] (${parts.join(", ")}, relevance: ${d.score.toFixed(3)})\n${body}`;
+      return `[${ordinals?.[i] ?? i + 1}] (${parts.join(", ")}, relevance: ${d.score.toFixed(3)})\n${body}`;
     })
     .join("\n\n---\n\n");
 }
@@ -106,18 +121,58 @@ export async function retrieve(
   query: string,
   options: { history?: string; topK?: number; expand?: boolean; mode?: ThinkingMode } = {},
 ): Promise<RetrievalResult> {
-  const { history = "", expand = true, mode = "standard" } = options;
-  const profile = RETRIEVAL_PROFILES[mode];
-  const topK = options.topK ?? profile.FINAL_TOP_K;
+  return withRetrievalSlot(async () => {
+    const { history = "", expand = true, mode = "standard" } = options;
+    const profile = RETRIEVAL_PROFILES[mode];
+    const topK = options.topK ?? profile.FINAL_TOP_K;
 
-  const queries = expand ? await planQueries(query, history, profile) : [query];
-  const fused = await hybridSearch(queries);
-  const ranked = await rerankDocuments(query, fused, topK);
+    const queries = expand ? await planQueries(query, history, profile) : [query];
+    const fused = await hybridSearch(queries);
+    const ranked = await rerankDocuments(query, fused, topK);
 
-  return {
-    documents: ranked,
-    context: formatContext(ranked),
-    queriesUsed: queries,
-    topScore: ranked[0]?.score ?? 0,
-  };
+    return {
+      documents: ranked,
+      context: formatContext(ranked),
+      queriesUsed: queries,
+      topScore: ranked[0]?.score ?? 0,
+    };
+  });
+}
+
+/* ------------------------------------------------------------------ *
+ * Concurrency control
+ * ------------------------------------------------------------------ */
+
+/**
+ * Bound how many retrieval pipelines run at once.
+ *
+ * Model calls scale out across rotating provider keys; retrieval does not.
+ * Embeddings and reranking both go to Cohere, which is the single shared
+ * dependency here, so a fan-out of research branches multiplies the load on one
+ * quota by the width of the fan-out. Measured with three concurrent branches
+ * and no limit, every one of the eight Cohere keys was exhausted in turn and
+ * the rotation spent the run failing over — making the fan-out slower than
+ * running the same branches sequentially.
+ *
+ * A queue rather than a rate limiter because the constraint is concurrency, not
+ * a schedule: work waits for a slot and starts the instant one frees, so the
+ * limit costs nothing when fewer branches are running than there are slots,
+ * which is every non-delegating request.
+ */
+let activeRetrievals = 0;
+const retrievalQueue: Array<() => void> = [];
+
+async function withRetrievalSlot<T>(run: () => Promise<T>): Promise<T> {
+  if (activeRetrievals >= SUBAGENT_CONFIG.RETRIEVAL_CONCURRENCY) {
+    await new Promise<void>((resolve) => retrievalQueue.push(resolve));
+  }
+  activeRetrievals++;
+  try {
+    return await run();
+  } finally {
+    activeRetrievals--;
+    // Released in `finally` so a failed retrieval frees its slot too; leaking
+    // one would shrink the pool permanently and eventually deadlock the queue.
+    retrievalQueue.shift()?.();
+  }
 }

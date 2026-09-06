@@ -98,6 +98,26 @@ function sseStream(run: (emit: Emit, signal: AbortSignal) => Promise<void>): Res
   });
 }
 
+/**
+ * True when a streamed chunk came from a nested graph rather than the supervisor.
+ *
+ * LangGraph builds a nested run's checkpoint namespace by appending to its
+ * parent's, separated by `|`, so depth is a structural property of the run
+ * rather than anything a model or a tool controls. The root graph's own nodes
+ * are at depth zero or one; a researcher invoked inside `delegate_research` is
+ * deeper.
+ *
+ * Erring towards treating a chunk as nested is the safe direction: the worst
+ * case is that a token is not streamed live, and the answer is still delivered
+ * whole from the update stream. The opposite mistake puts a researcher's raw
+ * working in front of the user as if it were the answer.
+ */
+function isNested(meta: Record<string, unknown> | undefined): boolean {
+  const ns = meta?.checkpoint_ns ?? meta?.langgraph_checkpoint_ns;
+  if (typeof ns !== "string" || ns.length === 0) return false;
+  return ns.split("|").filter(Boolean).length > 1;
+}
+
 function clientKey(req: NextRequest): string {
   return (
     req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ||
@@ -130,7 +150,7 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  const { message, files, threadId, mode, webSearch, thinking } = parsed.data;
+  const { message, files, threadId, mode, webSearch, thinking, deepAgents } = parsed.data;
   const thread = threadId || randomUUID();
 
   return sseStream(async (emit, signal) => {
@@ -163,7 +183,11 @@ export async function POST(req: NextRequest) {
 
     /* --- Run the agent --- */
     emit("status", {
-      stage: thinking === "deep" ? "deep research" : "thinking",
+      stage: deepAgents
+        ? "delegating research"
+        : thinking === "deep"
+          ? "deep research"
+          : "thinking",
       detail: webSearch ? undefined : "documents only",
     });
 
@@ -171,6 +195,7 @@ export async function POST(req: NextRequest) {
       enableTodos: mode === "agentic",
       webSearch,
       mode: thinking,
+      deepAgents,
     });
 
     let answer = "";
@@ -191,7 +216,10 @@ export async function POST(req: NextRequest) {
 
     const stream = await agent.stream(
       { messages: [new HumanMessage(message)] },
-      { ...runConfig({ threadId: thread, signal, mode: thinking }), streamMode: ["updates", "messages"] },
+      {
+        ...runConfig({ threadId: thread, signal, mode: thinking, deepAgents }),
+        streamMode: ["updates", "messages"],
+      },
     );
 
     for await (const chunk of stream) {
@@ -200,7 +228,19 @@ export async function POST(req: NextRequest) {
 
       if (streamMode === "messages") {
         // Token-level streaming of the model's visible output.
-        const [token] = payload as [{ content?: unknown; getType?: () => string }];
+        const [token, meta] = payload as [
+          { content?: unknown; getType?: () => string },
+          Record<string, unknown> | undefined,
+        ];
+
+        // Subagents run inside the `task` tool, and the callback manager is
+        // inherited, so their model output arrives on this same stream. Emitting
+        // it would splice every researcher's internal working into the user's
+        // answer. Nesting depth is the discriminator: LangGraph namespaces a
+        // nested run by appending to its parent's, so anything deeper than the
+        // root graph is a delegation and belongs only in the finding it returns.
+        if (isNested(meta)) continue;
+
         const type = token?.getType?.();
         if (type === "ai") {
           const text = visibleText(token.content);
@@ -248,6 +288,29 @@ export async function POST(req: NextRequest) {
               const id = call.id ?? `${call.name}:${JSON.stringify(call.args ?? {})}`;
               if (reportedCalls.has(id)) continue;
               reportedCalls.add(id);
+
+              // A delegation is not an ordinary tool call and reporting it as
+              // one hides the thing the user most wants to see: several `task`
+              // calls in a single message are the fan-out, and rendering them
+              // as five identical "task" rows says nothing about which
+              // sub-questions are being researched or by whom.
+              if (call.name === "delegate_research") {
+                const args = (call.args ?? {}) as {
+                  tasks?: Array<{ researcher?: string; question?: string }>;
+                };
+                // One call starts a whole batch, so report each branch
+                // separately — the fan-out is precisely what the user is
+                // waiting on, and a single "delegate_research" row hides it.
+                (args.tasks ?? []).forEach((t, i) => {
+                  emit("delegation", {
+                    id: `${id}:${i}`,
+                    agent: t.researcher ?? "researcher",
+                    task: t.question ?? "",
+                  });
+                });
+                continue;
+              }
+
               emit("tool_call", { name: call.name, args: call.args, node });
             }
           } else if (type === "tool") {
@@ -255,7 +318,16 @@ export async function POST(req: NextRequest) {
               last?.tool_call_id ?? `${last?.name}:${String(last?.content).slice(0, 60)}`;
             if (!reportedResults.has(id)) {
               reportedResults.add(id);
-              emit("tool_result", { name: last?.name ?? "tool" });
+              if (last?.name === "delegate_research") {
+                // The batch resolves as one tool message, so every branch it
+                // started completes together. Close them all.
+                emit("delegation_result", {
+                  batchId: last?.tool_call_id ?? id,
+                  chars: String(last?.content ?? "").length,
+                });
+              } else {
+                emit("tool_result", { name: last?.name ?? "tool" });
+              }
             }
           } else if (type === "ai") {
             const text = visibleText(last?.content);

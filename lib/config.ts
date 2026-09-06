@@ -389,9 +389,29 @@ export const RETRIEVAL_CONFIG = {
 
 /** Hard ceilings that bound cost and stop runaway agent loops. */
 export const GUARDRAIL_CONFIG = {
+  /* --- What actually bounds cost --- */
   MAX_TOOL_CALLS_PER_RUN: 25,
+  /**
+   * The real spend ceiling. Enforced by middleware with exitBehavior "end", so
+   * hitting it returns the best answer so far instead of throwing it away.
+   */
   MAX_MODEL_CALLS_PER_RUN: 20,
-  MAX_AGENT_ITERATIONS: 30,
+
+  /**
+   * LangGraph recursion limit — graph steps, not model calls, and the two are
+   * nowhere near the same number.
+   *
+   * Every middleware contributes its own node per hook, so one model turn costs
+   * roughly a dozen steps before any tool runs. At 30 the budget was exhausted
+   * after three or four turns, and a question needing several lookups died with
+   * "Recursion limit reached" and no answer at all — while the model-call limit
+   * that is supposed to bound cost had barely been touched.
+   *
+   * Raising this does not raise spend: MAX_MODEL_CALLS_PER_RUN still caps the
+   * calls and ends the run gracefully. This only stops the step counter from
+   * pre-empting that limit and turning a completable question into an error.
+   */
+  MAX_AGENT_ITERATIONS: 250,
   MAX_INPUT_CHARS: 8000,
   MAX_FILE_BYTES: 25 * 1024 * 1024,
   /** Minimum groundedness score (0-1) an answer must reach to be returned. */

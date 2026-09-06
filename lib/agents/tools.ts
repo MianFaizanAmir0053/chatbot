@@ -32,6 +32,9 @@ const NO_RESULTS =
 const INTERNAL_HOST = /^(localhost|127\.|0\.|10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|169\.254\.|::1$|\[::1\])/i;
 
 export function buildTools(collector: EvidenceCollector) {
+  /** Per-run record of tool calls already made, keyed by name and arguments. */
+  const callLog = new Map<string, number>();
+
   /**
    * The primary RAG tool: hybrid retrieval + cross-encoder reranking.
    *
@@ -40,7 +43,7 @@ export function buildTools(collector: EvidenceCollector) {
    * search again. That loop is what separates agentic RAG from a fixed pipeline.
    */
   const searchDocuments = tool(
-    async ({ query, topK }) => {
+    withRepeatGuard("search_documents", callLog, async ({ query, topK }: { query: string; topK?: number }) => {
       const result = await retrieve(query, { topK: topK ?? RETRIEVAL_CONFIG.FINAL_TOP_K });
       collector.searches.push(query);
 
@@ -62,7 +65,7 @@ export function buildTools(collector: EvidenceCollector) {
         `Found ${result.documents.length} passages ` +
         `(top relevance ${result.topScore.toFixed(3)}):\n\n${formatContext(result.documents)}`
       );
-    },
+    }),
     {
       name: "search_documents",
       description:
@@ -78,7 +81,7 @@ export function buildTools(collector: EvidenceCollector) {
   );
 
   const listDocuments = tool(
-    async () => {
+    withRepeatGuard("list_documents", callLog, async () => {
       const status = await knowledgeBaseStatus();
       if (status.documents.length === 0) {
         return "The knowledge base is empty. No documents have been uploaded yet.";
@@ -88,7 +91,7 @@ export function buildTools(collector: EvidenceCollector) {
         `${status.totalChunks} chunks total:\n` +
         status.documents.map((d) => `- ${d.source} (${d.chunks} chunks)`).join("\n")
       );
-    },
+    }),
     {
       name: "list_documents",
       description:
@@ -99,7 +102,7 @@ export function buildTools(collector: EvidenceCollector) {
   );
 
   const searchWeb = tool(
-    async ({ query, maxResults }) => {
+    withRepeatGuard("web_search", callLog, async ({ query, maxResults }: { query: string; maxResults?: number }) => {
       const outcome = await webSearch(query, maxResults ?? 5);
       collector.searches.push(`web: ${query}`);
 
@@ -117,7 +120,7 @@ export function buildTools(collector: EvidenceCollector) {
           .map((r, i) => `[W${i + 1}] ${r.title}\n${r.url}\n${r.content.slice(0, 1200)}`)
           .join("\n\n---\n\n")
       );
-    },
+    }),
     {
       name: "web_search",
       description:
@@ -133,7 +136,7 @@ export function buildTools(collector: EvidenceCollector) {
   );
 
   const fetchUrl = tool(
-    async ({ url }) => {
+    withRepeatGuard("fetch_url", callLog, async ({ url }: { url: string }) => {
       let parsed: URL;
       try {
         parsed = new URL(url);
@@ -171,7 +174,7 @@ export function buildTools(collector: EvidenceCollector) {
       } catch (error) {
         return `Fetch failed: ${error instanceof Error ? error.message : String(error)}`;
       }
-    },
+    }),
     {
       name: "fetch_url",
       description:
@@ -210,3 +213,71 @@ export function buildTools(collector: EvidenceCollector) {
 
   return [searchDocuments, listDocuments, searchWeb, fetchUrl, calculator];
 }
+
+/* ------------------------------------------------------------------ *
+ * Repeat-call suppression
+ * ------------------------------------------------------------------ */
+
+/**
+ * Wrap a tool implementation so an identical repeat is answered, not re-run.
+ *
+ * Applied to the implementation rather than to the tool's `invoke`: patching
+ * `invoke` looked equivalent and never fired once, because that is not the path
+ * the agent runtime takes. The function passed to `tool()` is code we own and
+ * is unambiguously on the call path.
+ *
+ * A stalled agent does not wander, it repeats — a measured run spent its whole
+ * step budget alternating between two calls it had already made. Re-running
+ * those costs an embedding, a rerank against the Cohere quota, and another full
+ * passage payload through the context window, which is most of the token spend
+ * on a stalled run.
+ *
+ * The reply is a short instruction rather than the cached payload: the model
+ * already holds the passages from the first call, so resending them adds tokens
+ * without adding information, and identical input is what kept producing
+ * identical output.
+ */
+function withRepeatGuard<A>(
+  name: string,
+  seen: Map<string, number>,
+  run: (args: A) => Promise<string>,
+): (args: A) => Promise<string> {
+  return async (args: A) => {
+    const key = `${name}:${JSON.stringify(args ?? {})}`;
+    const count = (seen.get(key) ?? 0) + 1;
+    seen.set(key, count);
+
+    if (count > 1) {
+      console.warn(`[tools] ${name} repeated (call ${count}) — answered without re-running`);
+      return (
+        `You already called ${name} with these exact arguments ${count - 1} time(s) in this ` +
+        `turn and the result has not changed. Do not repeat it. Either use genuinely different ` +
+        `wording, use a different tool, or answer now from what you have already retrieved — ` +
+        `including saying plainly that the documents do not cover it.`
+      );
+    }
+
+    return run(args);
+  };
+}
+
+/**
+ * Answer a repeated identical tool call from cache, and say so.
+ *
+ * Agents that stall do not wander — they repeat. A measured run issued six tool
+ * calls of which only two were distinct: `list_documents` three times and one
+ * `search_documents` three times, each returning exactly what it had returned
+ * before, until the recursion limit ended the request with no answer at all.
+ *
+ * Re-running those is the expensive part. A repeated search costs an embedding
+ * call, a rerank against the Cohere quota, and — worst of all — another full
+ * passage payload back through the context window, which is most of the token
+ * spend on a stalled run. Serving the repeat from cache removes that cost
+ * entirely.
+ *
+ * The response is deliberately a short instruction rather than the cached
+ * payload: the model already has the passages from the first call, so resending
+ * them adds tokens without adding information, and the loop persists precisely
+ * because identical input keeps producing identical output. Telling it plainly
+ * that the call was repeated is the part that breaks the cycle.
+ */

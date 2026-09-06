@@ -177,6 +177,10 @@ export async function POST(req: NextRequest) {
      * here means the transcript is correct either way.
      */
     let bufferedAnswer = "";
+    /** Tool calls already reported, so a middleware re-emit is not a second step. */
+    const reportedCalls = new Set<string>();
+    /** Tool results already reported, for the same reason. */
+    const reportedResults = new Set<string>();
 
     const stream = await agent.stream(
       { messages: [new HumanMessage(message)] },
@@ -212,8 +216,9 @@ export async function POST(req: NextRequest) {
 
           const last = update?.messages?.at?.(-1) as
             | {
-                tool_calls?: Array<{ name: string; args: unknown }>;
+                tool_calls?: Array<{ id?: string; name: string; args: unknown }>;
                 name?: string;
+                tool_call_id?: string;
                 content?: unknown;
                 getType?: () => string;
               }
@@ -227,10 +232,24 @@ export async function POST(req: NextRequest) {
 
           if (last?.tool_calls?.length) {
             for (const call of last.tool_calls) {
+              // Middleware nodes re-emit the model's last message as their own
+              // update, so one tool call arrives from model_request and again
+              // from every after_model hook. Reporting each occurrence showed
+              // the same step three times in the trace and made a single search
+              // look like a loop. Identity is the call, not the node that
+              // mentioned it.
+              const id = call.id ?? `${call.name}:${JSON.stringify(call.args ?? {})}`;
+              if (reportedCalls.has(id)) continue;
+              reportedCalls.add(id);
               emit("tool_call", { name: call.name, args: call.args, node });
             }
           } else if (type === "tool") {
-            emit("tool_result", { name: last?.name ?? "tool" });
+            const id =
+              last?.tool_call_id ?? `${last?.name}:${String(last?.content).slice(0, 60)}`;
+            if (!reportedResults.has(id)) {
+              reportedResults.add(id);
+              emit("tool_result", { name: last?.name ?? "tool" });
+            }
           } else if (type === "ai") {
             const text = visibleText(last?.content);
             if (text) bufferedAnswer = text;

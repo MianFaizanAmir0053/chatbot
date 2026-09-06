@@ -136,6 +136,10 @@ export const ChatRequestSchema = z.object({
    */
   threadId: z.string().nullish(),
   mode: z.enum(["agentic", "fast"]).default("agentic"),
+  /** Give the agent the web tools. Off restricts answers to the uploaded documents. */
+  webSearch: z.boolean().default(true),
+  /** Reasoning depth: retrieval breadth, iteration budget and prompt contract. */
+  thinking: z.enum(["standard", "deep"]).default("standard"),
 });
 
 export type ChatRequest = z.infer<typeof ChatRequestSchema>;

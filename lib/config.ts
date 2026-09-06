@@ -388,6 +388,36 @@ export const RETRIEVAL_CONFIG = {
 } as const;
 
 /** Hard ceilings that bound cost and stop runaway agent loops. */
+/**
+ * Retrieval depth per thinking mode.
+ *
+ * One `search_documents` call is not one request: it plans queries with a model,
+ * then runs a dense and a sparse probe per query variant, then reranks the pool.
+ * So the variant count multiplies embedding calls and the rerank payload, and is
+ * the single biggest lever on both latency and spend.
+ *
+ * Standard is deliberately tighter than the previous fixed settings — most
+ * questions are answered by the first two probes, and the extra four bought
+ * little beyond latency. Deep spends that budget and more, on purpose: it is
+ * for the questions where breadth of evidence is the point.
+ */
+export const RETRIEVAL_PROFILES = {
+  standard: {
+    QUERY_VARIANTS: 2,
+    MAX_QUERIES: 3,
+    FINAL_TOP_K: 6,
+    FUSION_TOP_K: 40,
+  },
+  deep: {
+    QUERY_VARIANTS: 5,
+    MAX_QUERIES: 9,
+    FINAL_TOP_K: 14,
+    FUSION_TOP_K: 80,
+  },
+} as const;
+
+export type ThinkingMode = keyof typeof RETRIEVAL_PROFILES;
+
 export const GUARDRAIL_CONFIG = {
   /* --- What actually bounds cost --- */
   MAX_TOOL_CALLS_PER_RUN: 25,

@@ -1,6 +1,6 @@
 import { HumanMessage, SystemMessage } from "@langchain/core/messages";
 import { z } from "zod";
-import { RETRIEVAL_CONFIG } from "../config";
+import { RETRIEVAL_PROFILES, type ThinkingMode } from "../config";
 import { getAuxModels } from "../models";
 import { structuredInvoke } from "../structured";
 import { hybridSearch } from "./hybrid";
@@ -38,13 +38,17 @@ export interface RetrievalResult {
  *
  * Runs on the FAST tier — it is a high-volume call and does not need the pro model.
  */
-async function planQueries(query: string, history: string): Promise<string[]> {
+async function planQueries(
+  query: string,
+  history: string,
+  profile: (typeof RETRIEVAL_PROFILES)[ThinkingMode],
+): Promise<string[]> {
   try {
     
     const plan = await structuredInvoke(getAuxModels("fast"), QueryPlanSchema, [
       new SystemMessage(
         "You rewrite user questions into effective document-retrieval queries.\n" +
-          `Produce exactly ${RETRIEVAL_CONFIG.QUERY_VARIANTS} distinct paraphrases that a ` +
+          `Produce exactly ${profile.QUERY_VARIANTS} distinct paraphrases that a ` +
           "technical document might use, the rare literal terms worth matching exactly, " +
           "and one short hypothetical answer (1-2 sentences) as if quoting the document. " +
           "Resolve pronouns and references using the conversation history.",
@@ -58,14 +62,14 @@ async function planQueries(query: string, history: string): Promise<string[]> {
       query,
       // Smaller models ignore the requested count — one returned 45 variants,
       // which would have fanned out into 90 searches. Cap it at the source.
-      ...(plan.variants ?? []).slice(0, RETRIEVAL_CONFIG.QUERY_VARIANTS),
+      ...(plan.variants ?? []).slice(0, profile.QUERY_VARIANTS),
       ...(plan.keywords?.length ? [plan.keywords.slice(0, 8).join(" ")] : []),
       ...(plan.hypotheticalAnswer ? [plan.hypotheticalAnswer] : []),
     ];
 
     return [...new Set(queries.map((q) => q.trim()).filter(Boolean))].slice(
       0,
-      RETRIEVAL_CONFIG.MAX_QUERIES,
+      profile.MAX_QUERIES,
     );
   } catch (error) {
     console.error("[retrieval] query planning failed, using raw query:", error);
@@ -100,11 +104,13 @@ export function formatContext(docs: RankedDocument[]): string {
  */
 export async function retrieve(
   query: string,
-  options: { history?: string; topK?: number; expand?: boolean } = {},
+  options: { history?: string; topK?: number; expand?: boolean; mode?: ThinkingMode } = {},
 ): Promise<RetrievalResult> {
-  const { history = "", topK = RETRIEVAL_CONFIG.FINAL_TOP_K, expand = true } = options;
+  const { history = "", expand = true, mode = "standard" } = options;
+  const profile = RETRIEVAL_PROFILES[mode];
+  const topK = options.topK ?? profile.FINAL_TOP_K;
 
-  const queries = expand ? await planQueries(query, history) : [query];
+  const queries = expand ? await planQueries(query, history, profile) : [query];
   const fused = await hybridSearch(queries);
   const ranked = await rerankDocuments(query, fused, topK);
 

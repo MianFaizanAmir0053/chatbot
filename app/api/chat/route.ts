@@ -130,7 +130,7 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  const { message, files, threadId, mode } = parsed.data;
+  const { message, files, threadId, mode, webSearch, thinking } = parsed.data;
   const thread = threadId || randomUUID();
 
   return sseStream(async (emit, signal) => {
@@ -162,9 +162,16 @@ export async function POST(req: NextRequest) {
     }
 
     /* --- Run the agent --- */
-    emit("status", { stage: "thinking" });
+    emit("status", {
+      stage: thinking === "deep" ? "deep research" : "thinking",
+      detail: webSearch ? undefined : "documents only",
+    });
 
-    const { agent, collector } = buildAgent({ enableTodos: mode === "agentic" });
+    const { agent, collector } = buildAgent({
+      enableTodos: mode === "agentic",
+      webSearch,
+      mode: thinking,
+    });
 
     let answer = "";
     let lastTodos: unknown[] = [];
@@ -184,7 +191,7 @@ export async function POST(req: NextRequest) {
 
     const stream = await agent.stream(
       { messages: [new HumanMessage(message)] },
-      { ...runConfig({ threadId: thread, signal }), streamMode: ["updates", "messages"] },
+      { ...runConfig({ threadId: thread, signal, mode: thinking }), streamMode: ["updates", "messages"] },
     );
 
     for await (const chunk of stream) {

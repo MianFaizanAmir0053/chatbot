@@ -1,6 +1,6 @@
 import { tool } from "@langchain/core/tools";
 import { z } from "zod";
-import { RETRIEVAL_CONFIG } from "../config";
+import type { ThinkingMode } from "../config";
 import { knowledgeBaseStatus } from "../ingest/pipeline";
 import { formatContext, retrieve } from "../retrieval/pipeline";
 import type { RankedDocument } from "../retrieval/rerank";
@@ -31,7 +31,15 @@ const NO_RESULTS =
 /** Private ranges and loopback — blocked so a tool call cannot probe internal services. */
 const INTERNAL_HOST = /^(localhost|127\.|0\.|10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|169\.254\.|::1$|\[::1\])/i;
 
-export function buildTools(collector: EvidenceCollector) {
+export interface ToolOptions {
+  /** Include the web tools. Off means the agent answers only from documents. */
+  webSearch?: boolean;
+  /** Retrieval depth for search_documents. */
+  mode?: ThinkingMode;
+}
+
+export function buildTools(collector: EvidenceCollector, options: ToolOptions = {}) {
+  const { webSearch: allowWeb = true, mode = "standard" } = options;
   /** Per-run record of tool calls already made, keyed by name and arguments. */
   const callLog = new Map<string, number>();
 
@@ -44,7 +52,7 @@ export function buildTools(collector: EvidenceCollector) {
    */
   const searchDocuments = tool(
     withRepeatGuard("search_documents", callLog, async ({ query, topK }: { query: string; topK?: number }) => {
-      const result = await retrieve(query, { topK: topK ?? RETRIEVAL_CONFIG.FINAL_TOP_K });
+      const result = await retrieve(query, { topK, mode });
       collector.searches.push(query);
 
       if (result.documents.length === 0) return NO_RESULTS;
@@ -211,7 +219,11 @@ export function buildTools(collector: EvidenceCollector) {
     },
   );
 
-  return [searchDocuments, listDocuments, searchWeb, fetchUrl, calculator];
+  // Omitting the web tools rather than refusing inside them: a tool the model
+  // cannot see is one it cannot spend a turn discovering it may not use.
+  return allowWeb
+    ? [searchDocuments, listDocuments, searchWeb, fetchUrl, calculator]
+    : [searchDocuments, listDocuments, calculator];
 }
 
 /* ------------------------------------------------------------------ *

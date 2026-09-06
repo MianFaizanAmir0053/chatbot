@@ -19,21 +19,67 @@ function isHeading(line: string): boolean {
 }
 
 interface Section {
+  /** The immediate heading this text sits under. */
   heading: string;
+  /** Ancestor headings, outermost first — "Expenses > Travel > Meals". */
+  breadcrumb: string[];
   text: string;
   page?: number;
 }
 
-/** Split raw text into heading-delimited sections, tracking the source page. */
+/**
+ * Nesting depth of a heading, so ancestors can be tracked.
+ *
+ * Markdown states depth directly and numbered headings imply it — "3.2.1" is
+ * one level below "3.2". Everything else is treated as a single level, which is
+ * the safe assumption when the document gives no structural signal.
+ */
+function headingLevel(line: string): number {
+  const t = line.trim();
+  const md = /^(#{1,6})\s/.exec(t);
+  if (md) return md[1].length;
+  const numbered = /^(\d+(?:\.\d+)*)[.)]?\s/.exec(t);
+  if (numbered) return numbered[1].split(".").length;
+  return 1;
+}
+
+/**
+ * Short trailing sections are folded into the previous one.
+ *
+ * A heading immediately followed by another heading — common in tables of
+ * contents and in documents where a title sits on its own line above a figure —
+ * otherwise produces a chunk of a few words. Those were silently discarded by
+ * the minimum-length filter, taking their heading's content with them.
+ */
+const MIN_SECTION_CHARS = 120;
+
+/** Split raw text into heading-delimited sections, tracking page and ancestry. */
 function splitIntoSections(pages: string[]): Section[] {
   const sections: Section[] = [];
+  const ancestors: Array<{ level: number; title: string }> = [];
   let heading = "Introduction";
   let buffer: string[] = [];
   let pageOfBuffer = 1;
 
   const flush = () => {
     const text = buffer.join("\n").trim();
-    if (text) sections.push({ heading, text, page: pageOfBuffer });
+    if (!text) {
+      buffer = [];
+      return;
+    }
+
+    const previous = sections[sections.length - 1];
+    if (previous && text.length < MIN_SECTION_CHARS) {
+      // Too small to retrieve on its own; keep the words with their context.
+      previous.text += `\n\n${heading}\n${text}`;
+    } else {
+      sections.push({
+        heading,
+        breadcrumb: ancestors.map((a) => a.title),
+        text,
+        page: pageOfBuffer,
+      });
+    }
     buffer = [];
   };
 
@@ -42,7 +88,16 @@ function splitIntoSections(pages: string[]): Section[] {
     for (const line of pageText.split("\n")) {
       if (isHeading(line)) {
         flush();
-        heading = line.trim().replace(/^#{1,6}\s*/, "");
+        const title = line.trim().replace(/^#{1,6}\s*/, "");
+        const level = headingLevel(line);
+
+        // Drop any sibling or deeper heading; what remains is this one's path.
+        while (ancestors.length > 0 && ancestors[ancestors.length - 1].level >= level) {
+          ancestors.pop();
+        }
+        ancestors.push({ level, title });
+
+        heading = title;
         pageOfBuffer = pageNo;
       } else {
         if (buffer.length === 0) pageOfBuffer = pageNo;
@@ -96,10 +151,25 @@ export async function chunkDocument(
     const pieces = await splitter.splitText(section.text);
 
     pieces.forEach((piece, i) => {
-      const contextHeader =
-        section.heading && section.heading !== "Introduction"
-          ? `${title} > ${section.heading}`
-          : title;
+      // Full ancestry, not just the nearest heading. "Meals" alone is ambiguous
+      // across a document that also has expense, per-diem and hospitality
+      // sections; "Handbook > Expenses > Travel > Meals" is not, and the whole
+      // path is what the embedding sees.
+      const path = [title, ...section.breadcrumb];
+      if (section.heading !== "Introduction") path.push(section.heading);
+
+      // Deduplicate case-insensitively: a document's H1 usually restates its
+      // title, which would otherwise open every header with the same words
+      // twice and waste the most heavily weighted part of the embedded text.
+      const seenPart = new Set<string>();
+      const contextHeader = path
+        .filter((part) => {
+          const key = part.trim().toLowerCase();
+          if (!key || seenPart.has(key)) return false;
+          seenPart.add(key);
+          return true;
+        })
+        .join(" > ");
 
       chunks.push(
         new Document({

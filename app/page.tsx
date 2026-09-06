@@ -386,6 +386,8 @@ export default function ChatPage() {
   const [status, setStatus] = useState("");
   const [threadId, setThreadId] = useState<string | null>(null);
   const [dragging, setDragging] = useState(false);
+  const [webSearch, setWebSearch] = useState(true);
+  const [deepThinking, setDeepThinking] = useState(false);
 
   const endRef = useRef<HTMLDivElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -511,6 +513,8 @@ export default function ChatPage() {
           history,
           ...(threadId ? { threadId } : {}),
           mode: "agentic",
+          webSearch,
+          thinking: deepThinking ? "deep" : "standard",
         }),
         signal: controller.signal,
       });
@@ -804,7 +808,36 @@ export default function ChatPage() {
             )}
           </div>
 
-          <p className="mt-2 px-1 text-center text-[11px] text-ink-3">
+          <div className="mt-2 flex flex-wrap items-center gap-1.5 px-1">
+            <ModeToggle
+              active={webSearch}
+              onClick={() => setWebSearch(!webSearch)}
+              icon={<GlobeIcon className="w-3.5 h-3.5" />}
+              label="Web search"
+              title={
+                webSearch
+                  ? "The agent may search the web when your documents don't cover the question"
+                  : "Documents only — the web tools are withheld entirely"
+              }
+            />
+            <ModeToggle
+              active={deepThinking}
+              onClick={() => setDeepThinking(!deepThinking)}
+              icon={<SparkIcon className="w-3.5 h-3.5" />}
+              label="Deep research"
+              title={
+                deepThinking
+                  ? "Decomposes the question, probes each part separately, searches for contradicting evidence, and reports coverage gaps. Slower and more thorough."
+                  : "Standard depth — fastest, and enough for most single-fact questions"
+              }
+            />
+            <span className="ml-auto hidden text-[11px] text-ink-3 sm:inline">
+              <kbd className="font-mono">Enter</kbd> to send ·{" "}
+              <kbd className="font-mono">Shift + Enter</kbd> for a new line
+            </span>
+          </div>
+
+          <p className="sr-only">
             <kbd className="font-mono">Enter</kbd> to send ·{" "}
             <kbd className="font-mono">Shift + Enter</kbd> for a new line · drop a file anywhere to
             index it
@@ -826,6 +859,45 @@ export default function ChatPage() {
         </div>
       )}
     </div>
+  );
+}
+
+/**
+ * A composer toggle.
+ *
+ * Rendered as a pressable pill rather than a checkbox because these change what
+ * the next message costs and how long it takes, so the current state has to be
+ * readable at a glance from the composer itself.
+ */
+function ModeToggle({
+  active,
+  onClick,
+  icon,
+  label,
+  title,
+}: {
+  active: boolean;
+  onClick: () => void;
+  icon: React.ReactNode;
+  label: string;
+  title: string;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      title={title}
+      aria-pressed={active}
+      className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] font-medium transition-colors ${
+        active
+          ? "border-transparent"
+          : "border-line text-ink-3 hover:bg-surface-hover hover:text-ink-2"
+      }`}
+      style={active ? { background: "var(--accent-soft)", color: "var(--accent)" } : undefined}
+    >
+      {icon}
+      {label}
+    </button>
   );
 }
 

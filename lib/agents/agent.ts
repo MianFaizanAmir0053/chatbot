@@ -1,7 +1,7 @@
 import { createAgent } from "langchain";
 import { MemorySaver } from "@langchain/langgraph";
 import type { BaseCheckpointSaver } from "@langchain/langgraph";
-import { GUARDRAIL_CONFIG } from "../config";
+import { GUARDRAIL_CONFIG, type ThinkingMode } from "../config";
 import { getModel } from "../models";
 import { buildMiddleware } from "./middleware";
 import { buildTools, createEvidenceCollector, type EvidenceCollector } from "./tools";
@@ -62,19 +62,52 @@ export interface AgentRun {
 }
 
 /**
+ * Extra contract for deep mode.
+ *
+ * Deep mode is not "the same run with a larger budget" — a bigger candidate
+ * pool only helps if the agent actually interrogates it. This makes the extra
+ * spend buy coverage and self-checking: decompose before searching, probe each
+ * sub-question separately, seek disconfirming passages, and say where the
+ * documents are silent rather than smoothing over the gap.
+ */
+const DEEP_THINKING_PROMPT = `
+
+## Deep research mode
+
+This question warrants thorough investigation. Work it properly:
+
+1. **Decompose first.** Write a todo list breaking the question into every distinct sub-question, including the ones only implied by it. Keep it updated as you learn.
+2. **Search each sub-question separately.** One search per sub-question retrieves far better than one broad search. Vary your wording between attempts — synonyms, the document's likely phrasing, rare literal terms, section names.
+3. **Search again after reading.** What comes back usually reveals better vocabulary than the question used. Use it. Two or three refined passes are expected, not excessive.
+4. **Look for what would contradict you.** Before concluding, search for exceptions, conditions, limits and superseding rules. A confident answer that missed a caveat is worse than a hedged one.
+5. **Cross-check across sources.** Where several documents or sections bear on the same point, compare them and say so if they disagree.
+6. **Be explicit about coverage.** State what the documents establish, what they only imply, and what they do not address at all. Never fill a gap with plausible-sounding general knowledge.
+
+Structure the answer so the reasoning is inspectable: lead with the conclusion, then the evidence for each sub-question with its citations, then the limits and any conflicts you found.`;
+
+export interface AgentOptions {
+  enableTodos?: boolean;
+  /** Give the agent the web tools. Off restricts it to the uploaded documents. */
+  webSearch?: boolean;
+  /** Reasoning depth: retrieval breadth, iteration budget and the prompt contract. */
+  mode?: ThinkingMode;
+}
+
+/**
  * Build a configured agent instance.
  *
  * A fresh evidence collector is created per run so citations reflect only the
  * current turn's retrievals, while conversational memory persists separately
  * through the checkpointer.
  */
-export function buildAgent(options: { enableTodos?: boolean } = {}): AgentRun {
+export function buildAgent(options: AgentOptions = {}): AgentRun {
+  const { webSearch = true, mode = "standard" } = options;
   const collector = createEvidenceCollector();
 
   const agent = createAgent({
     model: getModel("pro"),
-    tools: buildTools(collector),
-    systemPrompt: SUPERVISOR_PROMPT,
+    tools: buildTools(collector, { webSearch, mode }),
+    systemPrompt: mode === "deep" ? SUPERVISOR_PROMPT + DEEP_THINKING_PROMPT : SUPERVISOR_PROMPT,
     middleware: buildMiddleware({ enableTodos: options.enableTodos }),
     checkpointer: getCheckpointer(),
     name: "agentic_rag_supervisor",
@@ -86,13 +119,19 @@ export function buildAgent(options: { enableTodos?: boolean } = {}): AgentRun {
 export interface RunConfig {
   threadId: string;
   signal?: AbortSignal;
+  mode?: ThinkingMode;
 }
 
 /** Runtime config passed to every agent invocation. */
-export function runConfig({ threadId, signal }: RunConfig) {
+export function runConfig({ threadId, signal, mode = "standard" }: RunConfig) {
   return {
     configurable: { thread_id: threadId },
-    recursionLimit: GUARDRAIL_CONFIG.MAX_AGENT_ITERATIONS,
+    // Deep mode plans, probes each sub-question and re-searches, so it needs
+    // more graph steps. Spend stays bounded by the model-call ceiling.
+    recursionLimit:
+      mode === "deep"
+        ? GUARDRAIL_CONFIG.MAX_AGENT_ITERATIONS * 2
+        : GUARDRAIL_CONFIG.MAX_AGENT_ITERATIONS,
     signal,
   };
 }

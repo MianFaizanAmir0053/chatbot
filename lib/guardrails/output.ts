@@ -150,8 +150,15 @@ export async function checkGroundedness(
 export function normaliseCitations(answer: string): string {
   return (
     answer
-      // Unicode brackets, as in 【1†source】.
-      .replace(/【\s*(\d+)[^】]*】/g, "[$1]")
+      // Unicode brackets, as in 【1†source】 or 【W1†L1-L3】.
+      //
+      // The optional letter covers web citations, which `web_search` numbers
+      // [W1], [W2] to keep them in a separate namespace from document
+      // passages. The first version of this matched digits only, so document
+      // markers were repaired while web markers were left mangled — and they
+      // are the ones a user sees most, since any question the documents cannot
+      // answer is cited entirely this way.
+      .replace(/【\s*([A-Za-z]?\d+)[^】]*】/g, "[$1]")
       // Several numbers in one bracket: [1, 2] and [1;2] become [1][2].
       //
       // Must precede the suffix rule below, which would otherwise match `[1, 3]`
@@ -164,8 +171,9 @@ export function normaliseCitations(answer: string): string {
           .map((n) => `[${n.trim()}]`)
           .join(""),
       )
-      // A bracketed number carrying a suffix: [1†L1-L3], [1:page 4], [1 - policy].
-      .replace(/\[\s*(\d+)\s*[^\]\d\s][^\]]*\]/g, "[$1]")
+      // A bracketed reference carrying a suffix: [1†L1-L3], [W2†source],
+      // [1:page 4], [1 - policy].
+      .replace(/\[\s*([A-Za-z]?\d+)\s*[^\]\d\s][^\]]*\]/g, "[$1]")
       // Stray whitespace inside an otherwise well-formed marker.
       .replace(/\[\s+(\d+)\s*\]|\[\s*(\d+)\s+\]/g, (_, a: string, b: string) => `[${a ?? b}]`)
   );

@@ -16,7 +16,8 @@
     "verify": "npm run typecheck && npm run lint && npm run smoke && npm run test:wiring && npm run test:persistence && npm run test:agents",
     "test:persistence": "tsx --env-file=.env scripts/persistence-test.ts",
     "test:agents": "tsx --env-file=.env scripts/deep-agents-test.ts",
-    "test:agents:live": "tsx --env-file=.env scripts/deep-agents-test.ts --live"
+    "test:agents:live": "tsx --env-file=.env scripts/deep-agents-test.ts --live",
+    "test:quality": "tsx --env-file=.env scripts/e2e-quality.ts"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.970.0",

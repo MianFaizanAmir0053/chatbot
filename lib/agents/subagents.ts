@@ -361,24 +361,54 @@ export function buildDelegationTool(
     const done = (outcome: string) =>
       console.log(`[branch] ${researcher}#${slot} ${outcome} in ${Date.now() - startedAt}ms`);
 
+    /**
+     * Latest assistant prose seen from this branch, kept outside the try.
+     *
+     * Streamed rather than awaited as one value so that a branch which runs out
+     * of budget still contributes what it learned. `invoke` throws on the
+     * recursion limit and the entire result is lost with it: a measured branch
+     * researched for 81 seconds, hit the ceiling, and returned nothing at all,
+     * while the supervisor was told the sub-question could not be researched.
+     * Streaming keeps each assistant turn as it arrives, so the throw costs the
+     * final tidy-up rather than the whole branch.
+     */
+    let partial = "";
+
+    const readText = (content: unknown): string =>
+      typeof content === "string"
+        ? content
+        : (content as Array<{ type?: string; text?: string }> | undefined)
+            ?.filter((b) => b?.type === "text")
+            .map((b) => b.text)
+            .join("") ?? "";
+
     try {
-      const result = await researcherFor(researcher, slot).invoke(
+      const stream = await researcherFor(researcher, slot).stream(
         { messages: [new HumanMessage(question)] },
         // Bounded here rather than by middleware inside the branch: a recursion
         // limit passed at invocation is per-call by construction and cannot be
         // inherited from the supervisor's state the way the limit middlewares'
         // counters are.
-        { recursionLimit },
+        { recursionLimit, streamMode: "updates" },
       );
 
-      const content = result.messages.at(-1)?.content;
-      const text =
-        typeof content === "string"
-          ? content
-          : (content as Array<{ type?: string; text?: string }> | undefined)
-              ?.filter((b) => b?.type === "text")
-              .map((b) => b.text)
-              .join("") ?? "";
+      for await (const update of stream) {
+        for (const node of Object.values(
+          (update ?? {}) as Record<string, { messages?: unknown[] }>,
+        )) {
+          const last = node?.messages?.at?.(-1) as
+            | { tool_calls?: unknown[]; getType?: () => string; content?: unknown }
+            | undefined;
+          // Only finished assistant prose. A message carrying tool calls is the
+          // branch deciding what to do next, not reporting what it found.
+          if (last?.getType?.() === "ai" && !(last.tool_calls as unknown[])?.length) {
+            const t = readText(last.content);
+            if (t.trim()) partial = t;
+          }
+        }
+      }
+
+      const text = partial;
 
       // A branch whose model calls were exhausted returns normally, and the
       // retry middleware's own message becomes its "finding".
@@ -428,6 +458,25 @@ export function buildDelegationTool(
       }`;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      const exhausted = /[Rr]ecursion limit/.test(message);
+
+      // A branch that ran out of steps usually has findings, just no closing
+      // summary — it was still searching when the ceiling stopped it. Returning
+      // what it gathered is far better than discarding the work and telling the
+      // supervisor the sub-question is unresearched, which invites it either to
+      // spend another round re-asking or to report a gap that is not real.
+      if (partial.trim()) {
+        done(exhausted ? "PARTIAL (budget)" : "PARTIAL (error)");
+        console.warn(`[delegate] ${researcher} returned partial: ${message.slice(0, 100)}`);
+        return (
+          `${label}\n${normaliseCitations(partial).trim()}\n\n` +
+          `(PARTIAL — this researcher ${
+            exhausted ? "reached its search budget" : "hit an error"
+          } before finishing. What is above was found and is usable; treat anything it does ` +
+          `not mention as unchecked rather than absent.)`
+        );
+      }
+
       done("FAILED");
       console.warn(`[delegate] ${researcher} failed: ${message.slice(0, 120)}`);
       return `${label}\nFAILED — ${message.slice(0, 200)}\nTreat this sub-question as unresearched.`;

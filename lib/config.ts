@@ -688,8 +688,16 @@ export const SUBAGENT_CONFIG = {
    * either way. Capping it converts a straggler into a prompt, honest "the
    * documents do not address this" — which is the same answer the long version
    * reached, several minutes sooner.
+   *
+   * Forty-eight rather than thirty-six: at the tighter figure a branch hit the
+   * ceiling mid-search after eighty-one seconds, and back then that cost the
+   * whole branch. Exhaustion is now recoverable — the branch streams, so
+   * whatever it had found is returned as a partial finding — which makes the
+   * ceiling a safety net rather than a cliff, and makes a little more headroom
+   * cheap. It still bounds a genuinely stuck branch well inside the turn's
+   * shared model-call budget.
    */
-  BRANCH_RECURSION_LIMIT: 36,
+  BRANCH_RECURSION_LIMIT: 48,
 
   /**
    * Full retrieval pipelines allowed to run at once, across all branches.

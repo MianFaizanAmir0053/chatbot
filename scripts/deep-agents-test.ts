@@ -169,6 +169,24 @@ function citationRepair() {
     normaliseCitations(mixed) === "Evidence: [2] and [1] and [3].",
     normaliseCitations(mixed),
   );
+
+  // Web citations live in their own namespace — web_search numbers results
+  // [W1], [W2] so they cannot be confused with document passages. The first
+  // version of the repair matched digits only, so document markers were fixed
+  // while web markers stayed mangled: a measured answer read "roughly 14
+  // million people 【W1†L1-L3】【W2†L1-L3】". Those are the markers a user sees
+  // most, since any question the documents cannot answer is cited entirely
+  // this way.
+  const web = "Population is roughly 14 million 【W1†L1-L3】【W2†L1-L3】.";
+  check(
+    "repairs web citation markers too",
+    normaliseCitations(web) === "Population is roughly 14 million [W1][W2].",
+    normaliseCitations(web),
+  );
+  check(
+    "leaves well-formed web markers alone",
+    normaliseCitations("Tokyo [W1] and Osaka [W2].") === "Tokyo [W1] and Osaka [W2].",
+  );
 }
 
 /**

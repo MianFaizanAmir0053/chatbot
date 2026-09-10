@@ -1,7 +1,7 @@
 import { BM25Retriever } from "@langchain/community/retrievers/bm25";
 import { Document } from "@langchain/core/documents";
 import { RETRIEVAL_CONFIG } from "../config";
-import { getVectorStore } from "../vectorstore";
+import { getVectorStore, scopeIds, type ThreadScope } from "../vectorstore";
 
 /**
  * Hybrid retrieval: dense vectors + BM25, fused with Reciprocal Rank Fusion.
@@ -27,22 +27,54 @@ export function invalidateSparseIndex(): void {
  * It is rebuilt only when invalidated by an ingest, not per query — building it
  * scans every chunk, which would otherwise dominate query latency.
  */
-async function getSparseIndex(k: number): Promise<BM25Retriever | null> {
-  if (sparseIndex) {
-    sparseIndex.k = k;
-    return sparseIndex;
-  }
+async function getSparseIndex(): Promise<BM25Retriever | null> {
+  if (sparseIndex) return sparseIndex;
+
   const store = await getVectorStore();
   const docs = await store.getAllDocuments();
   if (docs.length === 0) return null;
 
-  sparseIndex = BM25Retriever.fromDocuments(docs, { k });
+  sparseIndex = BM25Retriever.fromDocuments(docs, { k: SPARSE_FETCH_K });
   sparseIndexSize = docs.length;
   return sparseIndex;
 }
 
+/**
+ * How many candidates the sparse index returns before scoping and trimming.
+ *
+ * Fixed at build time rather than set per call. The previous version assigned
+ * `sparseIndex.k` on every request, which was safe while requests were serial
+ * and is not now: delegated research runs several branches at once against this
+ * one shared index, so one branch's assignment silently changed how many
+ * results another branch got back.
+ *
+ * Generous because results are filtered afterwards. BM25 cannot filter by
+ * conversation, so a scoped search takes the top matches corpus-wide and then
+ * discards the ones belonging elsewhere — fetching exactly the number wanted
+ * would leave a conversation whose documents are a small slice of the corpus
+ * with almost nothing.
+ */
+const SPARSE_FETCH_K = 120;
+
 export function sparseIndexStats() {
   return { built: sparseIndex !== null, documents: sparseIndexSize };
+}
+
+/**
+ * Narrow documents to one conversation, keeping unscoped ones visible.
+ *
+ * Mirrors the rule the vector store enforces natively: a conversation sees its
+ * own documents plus any that predate scoping. Applied here because BM25 has no
+ * filter of its own — which is also why the sparse fetch is deliberately wide,
+ * so narrowing does not starve the fused pool.
+ */
+function scopeDocs(docs: Document[], threadId?: ThreadScope): Document[] {
+  const ids = scopeIds(threadId);
+  if (ids.length === 0) return docs;
+  return docs.filter((d) => {
+    const owner = d.metadata?.threadId;
+    return !owner || ids.includes(String(owner));
+  });
 }
 
 /** Stable identity for a chunk, used to align the same document across rankers. */
@@ -99,6 +131,7 @@ export function reciprocalRankFusion(
 export async function hybridSearch(
   queries: string[],
   limit: number = RETRIEVAL_CONFIG.FUSION_TOP_K,
+  threadId?: ThreadScope,
 ): Promise<FusedDocument[]> {
   const store = await getVectorStore();
 
@@ -111,7 +144,11 @@ export async function hybridSearch(
     Promise.all(
       queries.map(async (q, i) => {
         try {
-          const hits = await store.similaritySearchWithScore(q, RETRIEVAL_CONFIG.DENSE_TOP_K);
+          const hits = await store.similaritySearchWithScore(
+            q,
+            RETRIEVAL_CONFIG.DENSE_TOP_K,
+            threadId,
+          );
           return { name: `dense:${i}`, docs: hits.map(([doc]) => doc) };
         } catch (error) {
           console.error("[hybrid] dense search failed:", error);
@@ -120,13 +157,25 @@ export async function hybridSearch(
       }),
     ),
     (async () => {
-      const bm25 = await getSparseIndex(RETRIEVAL_CONFIG.SPARSE_TOP_K);
+      const bm25 = await getSparseIndex();
       if (!bm25) return [];
       return Promise.all(
         queries.map(async (q, i) => {
           try {
             const docs = await bm25.invoke(q);
-            return { name: `sparse:${i}`, docs: docs as Document[] };
+            // The sparse index spans the whole corpus and is rebuilt only on
+            // ingest, so scoping is applied to its results rather than to the
+            // index. Keeping one shared index is deliberate: a per-conversation
+            // index would be rebuilt on every switch and would hold the corpus
+            // once per open conversation.
+            //
+            // Trimmed after scoping, not before, or the trim would spend its
+            // budget on documents this conversation cannot see.
+            const scoped = scopeDocs(docs as Document[], threadId).slice(
+              0,
+              RETRIEVAL_CONFIG.SPARSE_TOP_K,
+            );
+            return { name: `sparse:${i}`, docs: scoped };
           } catch (error) {
             console.error("[hybrid] sparse search failed:", error);
             return { name: `sparse:${i}`, docs: [] as Document[] };

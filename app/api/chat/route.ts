@@ -1,7 +1,8 @@
 import { NextRequest } from "next/server";
 import { randomUUID } from "crypto";
-import { HumanMessage } from "@langchain/core/messages";
+import { AIMessage, HumanMessage, type BaseMessage } from "@langchain/core/messages";
 import { buildAgent, runConfig } from "@/lib/agents/agent";
+import { appendMessages, getConversation, scopeChainFor } from "@/lib/conversations/store";
 import { batchQualifiesForVerification } from "@/lib/agents/subagents";
 import { hasReasoningProvider } from "@/lib/config";
 import { ChatRequestSchema, guardInput } from "@/lib/guardrails/input";
@@ -17,6 +18,14 @@ export const runtime = "nodejs";
 // The agent loop can run well past the default serverless budget on multi-step
 // questions, so ask for the maximum the platform will grant.
 export const maxDuration = 300;
+
+/**
+ * How much of a stored transcript is replayed into a thread whose checkpoint
+ * is gone. Every replayed turn is context the model pays for on this turn, so
+ * this trades recall against cost; the most recent turns carry nearly all of
+ * the referential weight ("it", "the second one") that replay exists to serve.
+ */
+const MAX_REPLAYED_TURNS = 12;
 
 /* ------------------------------------------------------------------ *
  * SSE helpers
@@ -163,16 +172,31 @@ export async function POST(req: NextRequest) {
     if (!verdict.allowed) {
       emit("blocked", { reason: verdict.reason, signals: verdict.signals });
       emit("token", { text: verdict.reason });
+      // Kept in the transcript so reopening the thread shows why it stopped
+      // rather than an unexplained gap.
+      const at = new Date().toISOString();
+      await appendMessages(thread, [
+        { role: "user", content: message, createdAt: at },
+        { role: "assistant", content: verdict.reason ?? "Blocked", blocked: true, createdAt: at },
+      ]);
       return;
     }
     if (verdict.signals.length > 0) {
       console.warn(`[chat] input signals (allowed): ${verdict.signals.join(", ")}`);
     }
 
+    // Recorded before the run, not after it: a question whose answer is
+    // abandoned, aborted or lost to a crash still has to be findable in the
+    // conversation list, which is the only way back to the thread.
+    await appendMessages(thread, [
+      { role: "user", content: message, createdAt: new Date().toISOString() },
+    ]);
+
     /* --- Ingest any newly attached files into the vector store --- */
     if (files.length > 0) {
       emit("status", { stage: "ingesting", detail: `Processing ${files.length} file(s)` });
-      const results = await ingestFiles(files);
+      // Attached mid-conversation, so they belong to this conversation.
+      const results = await ingestFiles(files.map((f) => ({ ...f, threadId: thread })));
       emit("ingested", { results });
 
       const failed = results.filter((r) => r.status === "failed");
@@ -198,6 +222,12 @@ export async function POST(req: NextRequest) {
       webSearch,
       mode: thinking,
       deepAgents,
+      // This conversation and every ancestor it was forked from. Resolving the
+      // chain here rather than passing the bare id is what makes a fork usable:
+      // its documents live under the parent's id, so a fork scoped to itself
+      // alone would find nothing and confidently report that the documents do
+      // not cover the question.
+      threadId: await scopeChainFor(thread),
     });
 
     let answer = "";
@@ -218,12 +248,54 @@ export async function POST(req: NextRequest) {
     /** The automatic verification branch is announced once per turn. */
     let verificationShown = false;
 
+    const config = runConfig({ threadId: thread, signal, mode: thinking, deepAgents });
+
+    /**
+     * Rebuild the agent's memory when a reopened thread has none.
+     *
+     * The checkpointer is per-process: restart the server, or reopen a
+     * conversation stored yesterday, and the graph has no record of it while
+     * the user is looking at the whole transcript. Replaying the stored turns
+     * into this run's input restores the context the user can see, so a
+     * follow-up like "and the second one?" still resolves.
+     */
+    const priorMessages: BaseMessage[] = [];
+    if (threadId) {
+      let checkpointed = 0;
+      try {
+        // `getState` is typed against the graph's own state shape, which is not
+        // exported in a form this route can name; only the message count is
+        // needed, so it is read structurally.
+        const state = (await agent.getState(config)) as
+          | { values?: { messages?: unknown[] } }
+          | undefined;
+        checkpointed = state?.values?.messages?.length ?? 0;
+      } catch {
+        // No checkpoint for this thread; treat it as empty and replay.
+      }
+
+      if (checkpointed === 0) {
+        const stored = await getConversation(thread);
+        // The turn just recorded above is the incoming question — replaying it
+        // would send it twice.
+        const earlier = (stored?.messages ?? []).slice(0, -1).slice(-MAX_REPLAYED_TURNS);
+        for (const turn of earlier) {
+          priorMessages.push(
+            turn.role === "user" ? new HumanMessage(turn.content) : new AIMessage(turn.content),
+          );
+        }
+        if (priorMessages.length > 0) {
+          emit("status", {
+            stage: "restoring context",
+            detail: `${priorMessages.length} earlier turn(s)`,
+          });
+        }
+      }
+    }
+
     const stream = await agent.stream(
-      { messages: [new HumanMessage(message)] },
-      {
-        ...runConfig({ threadId: thread, signal, mode: thinking, deepAgents }),
-        streamMode: ["updates", "messages"],
-      },
+      { messages: [...priorMessages, new HumanMessage(message)] },
+      { ...config, streamMode: ["updates", "messages"] },
     );
 
     for await (const chunk of stream) {
@@ -466,17 +538,36 @@ export async function POST(req: NextRequest) {
     }
 
     /* --- Provenance --- */
+    const documents = collector.documents.map((d, i) => ({
+      index: i + 1,
+      source: String(d.doc.metadata?.source ?? "unknown"),
+      section: d.doc.metadata?.section as string | undefined,
+      page: d.doc.metadata?.page as number | undefined,
+      score: d.score,
+      excerpt: String(d.doc.metadata?.originalText ?? d.doc.pageContent).slice(0, 400),
+    }));
+
     emit("sources", {
-      documents: collector.documents.map((d, i) => ({
-        index: i + 1,
-        source: d.doc.metadata?.source,
-        section: d.doc.metadata?.section,
-        page: d.doc.metadata?.page,
-        score: d.score,
-        excerpt: String(d.doc.metadata?.originalText ?? d.doc.pageContent).slice(0, 400),
-      })),
+      documents,
       web: collector.webResults,
       searches: collector.searches,
     });
+
+    /* --- Transcript --- */
+    await appendMessages(thread, [
+      {
+        role: "assistant",
+        content: answer,
+        sources: documents,
+        web: collector.webResults,
+        groundedness: {
+          score: grounded.score,
+          verdict: grounded.verdict,
+          passed: grounded.passed,
+          unsupportedClaims: grounded.unsupportedClaims,
+        },
+        createdAt: new Date().toISOString(),
+      },
+    ]);
   });
 }

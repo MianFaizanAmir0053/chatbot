@@ -1,7 +1,10 @@
 "use client";
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useConversations } from "./components/conversations-context";
+import { DocumentsDialog, DocumentsTrigger } from "./components/documents-dialog";
 import { ACCEPTED_UPLOADS, useKnowledge } from "./components/knowledge-context";
+import { ThemeToggle } from "./components/theme-toggle";
 import { Button, Pill, type Tone } from "./components/ui";
 import {
   BrandMark,
@@ -12,7 +15,6 @@ import {
   GlobeIcon,
   LinkIcon,
   ListIcon,
-  PaperclipIcon,
   PlusIcon,
   SearchIcon,
   SendIcon,
@@ -93,11 +95,24 @@ const TOOL_LABELS: Record<string, string> = {
   write_todos: "Planning",
 };
 
+/** Opening prompts. The hint says which sources each one will actually reach. */
 const SUGGESTIONS = [
-  { icon: ListIcon, text: "Summarise the key findings across my documents" },
-  { icon: SearchIcon, text: "What does the documentation say about rate limits?" },
-  { icon: SparkIcon, text: "Compare the conclusions of the two most recent uploads" },
-  { icon: GlobeIcon, text: "Check my documents against current public guidance" },
+  { icon: ListIcon, text: "Summarise the key findings across my documents", hint: "Whole corpus" },
+  {
+    icon: SearchIcon,
+    text: "What does the documentation say about rate limits?",
+    hint: "Targeted retrieval",
+  },
+  {
+    icon: SparkIcon,
+    text: "Compare the conclusions of the two most recent uploads",
+    hint: "Two most recent documents",
+  },
+  {
+    icon: GlobeIcon,
+    text: "Check my documents against current public guidance",
+    hint: "Corpus · web search",
+  },
 ];
 
 function SimpleMarkdown({ content }: { content: string }) {
@@ -124,17 +139,32 @@ function SimpleMarkdown({ content }: { content: string }) {
 function TypingIndicator({ label }: { label?: string }) {
   return (
     <div className="flex items-center gap-2.5 py-1">
-      <span className="flex items-center gap-1">
-        {[0, 160, 320].map((delay) => (
+      <span className="flex items-end gap-1">
+        {[0, 140, 280].map((delay) => (
           <span
             key={delay}
-            className="w-1.5 h-1.5 rounded-full animate-pulse-dot"
-            style={{ background: "var(--accent)", animationDelay: `${delay}ms` }}
+            className="w-1.5 h-1.5 rounded-full animate-wave"
+            style={{ background: "var(--accent-color)", animationDelay: `${delay}ms` }}
           />
         ))}
       </span>
-      {label && <span className="text-xs text-ink-3">{label}</span>}
+      {label && (
+        // Keyed on the label so each new phase of the run announces itself
+        // with a small movement instead of silently swapping words.
+        <span key={label} className="animate-slide-in-left text-xs text-muted-foreground">
+          {label}
+        </span>
+      )}
     </div>
+  );
+}
+
+/** A keycap. Small enough to sit inside a hint line without shouting. */
+function Key({ children }: { children: React.ReactNode }) {
+  return (
+    <kbd className="rounded border border-border bg-secondary px-1 py-px font-mono text-[11px] font-medium text-foreground">
+      {children}
+    </kbd>
   );
 }
 
@@ -158,12 +188,24 @@ function CopyButton({ text }: { text: string }) {
       onClick={copy}
       title={done ? "Copied" : "Copy answer"}
       aria-label={done ? "Copied" : "Copy answer"}
-      className="grid h-7 w-7 place-items-center rounded-md text-ink-3 hover:bg-surface-hover hover:text-ink transition-colors"
+      className="press inline-flex h-7 items-center gap-1.5 rounded-md px-1.5 text-[11px] font-medium text-muted-foreground hover:bg-accent hover:text-foreground"
     >
       {done ? (
-        <CheckIcon className="w-3.5 h-3.5" style={{ color: "var(--success)" }} />
+        <>
+          <CheckIcon
+            key="done"
+            className="w-3.5 h-3.5 animate-pop"
+            style={{ color: "var(--success)" }}
+          />
+          <span className="animate-fade-in" style={{ color: "var(--success)" }}>
+            Copied
+          </span>
+        </>
       ) : (
-        <CopyIcon className="w-3.5 h-3.5" />
+        <>
+          <CopyIcon className="w-3.5 h-3.5" />
+          <span className="sr-only">Copy answer</span>
+        </>
       )}
     </button>
   );
@@ -176,22 +218,22 @@ function PlanPanel({ todos }: { todos: Todo[] }) {
   const pct = Math.round((done / todos.length) * 100);
 
   return (
-    <div className="mb-3 rounded-lg border border-line bg-surface-inset p-3">
+    <div className="mb-3 rounded-md border border-border bg-secondary p-3">
       <div className="mb-2.5 flex items-center justify-between gap-3">
-        <span className="text-[11px] font-semibold uppercase tracking-[0.08em] text-ink-3">
+        <span className="eyebrow font-semibold">
           Plan
         </span>
-        <span className="tnum text-[11px] text-ink-3">
+        <span className="tnum text-[11px] text-muted-foreground">
           {done}/{todos.length}
         </span>
       </div>
       <div
         className="mb-3 h-1 w-full overflow-hidden rounded-full"
-        style={{ background: "var(--surface-hover)" }}
+        style={{ background: "var(--accent)" }}
       >
         <div
-          className="h-full rounded-full transition-[width] duration-500"
-          style={{ width: `${pct}%`, background: "var(--accent)" }}
+          className="h-full rounded-full transition-[width] duration-700 ease-[cubic-bezier(0.32,0.72,0,1)]"
+          style={{ width: `${pct}%`, background: "var(--accent-color)" }}
         />
       </div>
       <ul className="space-y-1.5">
@@ -199,20 +241,20 @@ function PlanPanel({ todos }: { todos: Todo[] }) {
           <li key={i} className="flex items-start gap-2 text-[13px]">
             <span className="mt-[3px] shrink-0">
               {todo.status === "completed" ? (
-                <CheckIcon className="w-3.5 h-3.5" style={{ color: "var(--success)" }} />
+                <CheckIcon className="w-3.5 h-3.5 animate-pop" style={{ color: "var(--success)" }} />
               ) : todo.status === "in_progress" ? (
                 <span
                   className="block h-3 w-3 rounded-full border-2 border-current border-t-transparent animate-spin-slow"
-                  style={{ color: "var(--accent)" }}
+                  style={{ color: "var(--accent-color)" }}
                 />
               ) : (
                 <span
                   className="block h-3 w-3 rounded-full border-2"
-                  style={{ borderColor: "var(--line-strong)" }}
+                  style={{ borderColor: "var(--input)" }}
                 />
               )}
             </span>
-            <span className={todo.status === "completed" ? "text-ink-3 line-through" : "text-ink-2"}>
+            <span className={`transition-colors duration-300 ${todo.status === "completed" ? "text-muted-foreground line-through" : "text-foreground"}`}>
               {todo.content}
             </span>
           </li>
@@ -235,7 +277,7 @@ function TracePanel({ trace }: { trace: TraceEntry[] }) {
         type="button"
         onClick={() => setOpen(!open)}
         aria-expanded={open}
-        className="inline-flex items-center gap-1.5 rounded-md px-1.5 py-1 -ml-1.5 text-[11px] font-medium text-ink-3 hover:bg-surface-hover hover:text-ink transition-colors"
+        className="inline-flex items-center gap-1.5 rounded-md px-1.5 py-1 -ml-1.5 text-[11px] font-medium text-muted-foreground hover:bg-accent hover:text-foreground transition-colors"
       >
         <ChevronIcon
           className={`w-3 h-3 transition-transform duration-200 ${open ? "rotate-90" : ""}`}
@@ -249,9 +291,9 @@ function TracePanel({ trace }: { trace: TraceEntry[] }) {
       </button>
 
       {open && (
-        <ol className="mt-2 space-y-1.5 border-l border-line pl-3.5 ml-1 animate-fade-in">
+        <ol className="mt-2 space-y-1.5 border-l border-border pl-3.5 ml-1 stagger animate-fade-in">
           {trace.map((entry, i) => (
-            <li key={i} className="relative text-[11px] leading-relaxed text-ink-3">
+            <li key={i} className="relative text-[11px] leading-relaxed text-muted-foreground">
               <span
                 className="absolute -left-[18px] top-[5px] h-1.5 w-1.5 rounded-full"
                 style={{
@@ -259,12 +301,12 @@ function TracePanel({ trace }: { trace: TraceEntry[] }) {
                     entry.kind === "warning"
                       ? "var(--warn)"
                       : entry.kind === "tool"
-                        ? "var(--accent)"
+                        ? "var(--accent-color)"
                         : "var(--line-strong)",
                 }}
               />
-              <span className="text-ink-2">{entry.label}</span>
-              {entry.detail && <span className="text-ink-3"> — {entry.detail}</span>}
+              <span className="text-foreground">{entry.label}</span>
+              {entry.detail && <span className="text-muted-foreground"> — {entry.detail}</span>}
             </li>
           ))}
         </ol>
@@ -299,7 +341,7 @@ function DelegationPanel({ delegations }: { delegations: Delegation[] }) {
         type="button"
         onClick={() => setOpen(!open)}
         aria-expanded={open}
-        className="inline-flex items-center gap-1.5 rounded-md px-1.5 py-1 -ml-1.5 text-[11px] font-medium text-ink-3 hover:bg-surface-hover hover:text-ink transition-colors"
+        className="inline-flex items-center gap-1.5 rounded-md px-1.5 py-1 -ml-1.5 text-[11px] font-medium text-muted-foreground hover:bg-accent hover:text-foreground transition-colors"
       >
         <ChevronIcon
           className={`w-3 h-3 transition-transform duration-200 ${open ? "rotate-90" : ""}`}
@@ -307,26 +349,26 @@ function DelegationPanel({ delegations }: { delegations: Delegation[] }) {
         <NetworkIcon className="w-3.5 h-3.5" />
         {delegations.length} researcher{delegations.length === 1 ? "" : "s"}
         {running > 0 ? (
-          <span style={{ color: "var(--accent)" }}>· {running} running</span>
+          <span style={{ color: "var(--accent-color)" }}>· {running} running</span>
         ) : (
-          <span className="text-ink-3">· all reported</span>
+          <span className="text-muted-foreground">· all reported</span>
         )}
       </button>
 
       {open && (
-        <ul className="mt-2 space-y-1.5 border-l border-line pl-3.5 ml-1 animate-fade-in">
+        <ul className="mt-2 space-y-1.5 border-l border-border pl-3.5 ml-1 stagger animate-fade-in">
           {delegations.map((d) => (
             <li key={d.id} className="relative text-[11px] leading-relaxed">
               <span
                 className={`absolute -left-[18px] top-[5px] h-1.5 w-1.5 rounded-full ${
                   d.done ? "" : "animate-pulse"
                 }`}
-                style={{ background: d.done ? "var(--ok, var(--line-strong))" : "var(--accent)" }}
+                style={{ background: d.done ? "var(--ok, var(--line-strong))" : "var(--accent-color)" }}
               />
-              <span className="text-ink-2 font-medium">
+              <span className="text-foreground font-medium">
                 {AGENT_LABELS[d.agent] ?? d.agent}
               </span>
-              {d.task && <span className="text-ink-3"> — {d.task}</span>}
+              {d.task && <span className="text-muted-foreground"> — {d.task}</span>}
             </li>
           ))}
         </ul>
@@ -374,13 +416,13 @@ function SourcesPanel({
   if (sources.length === 0 && web.length === 0) return null;
 
   return (
-    <div className="mt-3 border-t border-line pt-2.5">
+    <div className="mt-3 border-t border-border pt-2.5">
       <button
         type="button"
         onClick={() => setOpen(!open)}
         aria-expanded={open}
-        className="inline-flex items-center gap-1.5 rounded-md px-1.5 py-1 -ml-1.5 text-[11px] font-semibold transition-colors hover:bg-surface-hover"
-        style={{ color: "var(--accent)" }}
+        className="inline-flex items-center gap-1.5 rounded-md px-1.5 py-1 -ml-1.5 text-[11px] font-semibold transition-colors hover:bg-accent"
+        style={{ color: "var(--accent-color)" }}
       >
         <ChevronIcon
           className={`w-3 h-3 transition-transform duration-200 ${open ? "rotate-90" : ""}`}
@@ -390,42 +432,42 @@ function SourcesPanel({
       </button>
 
       {open && (
-        <div className="mt-2.5 grid gap-2 animate-fade-in">
+        <div className="mt-2.5 grid gap-2 stagger animate-fade-in">
           {sources.map((s) => (
             <article
               key={s.index}
-              className="rounded-lg border border-line bg-surface-inset p-3"
+              className="lift rounded-md border border-border bg-secondary p-3"
             >
               <div className="flex items-start justify-between gap-3">
                 <div className="flex min-w-0 items-center gap-2">
                   <span
-                    className="tnum grid h-5 min-w-5 shrink-0 place-items-center rounded px-1 font-mono text-[10px] font-semibold"
-                    style={{ background: "var(--accent-soft)", color: "var(--accent)" }}
+                    className="tnum grid h-5 min-w-5 shrink-0 place-items-center rounded px-1 font-mono text-[11px] font-semibold"
+                    style={{ background: "var(--accent-soft)", color: "var(--accent-color)" }}
                   >
                     {s.index}
                   </span>
-                  <span className="truncate text-[12px] font-medium text-ink" title={s.source}>
+                  <span className="truncate text-[12px] font-medium text-foreground" title={s.source}>
                     {s.source}
                   </span>
                 </div>
                 <span
                   className="tnum shrink-0 text-[11px] font-medium"
                   title="Relevance score"
-                  style={{ color: "var(--ink-3)" }}
+                  style={{ color: "var(--muted-foreground)" }}
                 >
                   {Math.round(s.score * 100)}%
                 </span>
               </div>
 
               {(s.section || s.page) && (
-                <div className="mt-1 text-[11px] text-ink-3">
+                <div className="mt-1 text-[11px] text-muted-foreground">
                   {s.section}
                   {s.section && s.page ? " · " : ""}
                   {s.page ? `page ${s.page}` : ""}
                 </div>
               )}
 
-              <p className="mt-2 line-clamp-3 text-[12px] leading-relaxed text-ink-3">
+              <p className="mt-2 line-clamp-3 text-[12px] leading-relaxed text-muted-foreground">
                 {s.excerpt}
               </p>
             </article>
@@ -437,19 +479,19 @@ function SourcesPanel({
               href={w.url}
               target="_blank"
               rel="noopener noreferrer"
-              className="group rounded-lg border border-line bg-surface-inset p-3 transition-colors hover:bg-surface-hover"
+              className="lift group rounded-md border border-border bg-secondary p-3 hover:bg-accent"
             >
               <div className="flex items-center gap-2">
-                <GlobeIcon className="w-3.5 h-3.5 shrink-0 text-ink-3" />
+                <GlobeIcon className="w-3.5 h-3.5 shrink-0 text-muted-foreground" />
                 <span
                   className="truncate text-[12px] font-medium"
-                  style={{ color: "var(--accent)" }}
+                  style={{ color: "var(--accent-color)" }}
                 >
                   {w.title || w.url}
                 </span>
-                <LinkIcon className="w-3 h-3 shrink-0 text-ink-3 opacity-0 transition-opacity group-hover:opacity-100" />
+                <LinkIcon className="w-3 h-3 shrink-0 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100" />
               </div>
-              <div className="mt-1 truncate text-[11px] text-ink-3">{w.url}</div>
+              <div className="mt-1 truncate text-[11px] text-muted-foreground">{w.url}</div>
             </a>
           ))}
         </div>
@@ -462,8 +504,24 @@ function SourcesPanel({
  * Page
  * ------------------------------------------------------------------ */
 
+/** Keeps the address in step with the open thread, without a navigation. */
+function syncAddress(id: string | null) {
+  const url = id ? `/?c=${id}` : "/";
+  if (window.location.pathname + window.location.search !== url) {
+    window.history.replaceState(null, "", url);
+  }
+}
+
 export default function ChatPage() {
   const kb = useKnowledge();
+  const {
+    activeId,
+    setActiveId,
+    load: loadConversation,
+    refresh: refreshConversations,
+  } = useConversations();
+  /** The thread the view is currently showing, for change detection. */
+  const threadRef = useRef<string | null>(null);
 
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
@@ -475,15 +533,140 @@ export default function ChatPage() {
   const [deepThinking, setDeepThinking] = useState(false);
   const [deepAgents, setDeepAgents] = useState(false);
 
+  const [restoring, setRestoring] = useState(false);
+  const [docsOpen, setDocsOpen] = useState(false);
+
   const endRef = useRef<HTMLDivElement | null>(null);
+  const scrollRef = useRef<HTMLElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const dragDepth = useRef(0);
 
-  useEffect(() => {
+  // Whether the view is following the tail of the conversation. A long answer
+  // streams for tens of seconds; scrolling up to re-read an earlier passage has
+  // to survive the next token, so following stops the moment the user leaves
+  // the bottom and resumes when they return.
+  const [pinned, setPinned] = useState(true);
+
+  function onScroll(e: React.UIEvent<HTMLElement>) {
+    const el = e.currentTarget;
+    setPinned(el.scrollHeight - el.scrollTop - el.clientHeight < 80);
+  }
+
+  const jumpToLatest = useCallback(() => {
+    setPinned(true);
     endRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, status]);
+  }, []);
+
+  useEffect(() => {
+    if (!pinned) return;
+    endRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages, status, pinned]);
+
+  /**
+   * Adopt the conversation named in the address on first paint.
+   *
+   * Read from `window.location` rather than `useSearchParams`, which would
+   * force this prerendered page behind a Suspense boundary for a value only
+   * needed once the page is interactive. `popstate` keeps Back working.
+   */
+  useEffect(() => {
+    const adopt = () => {
+      const id = new URLSearchParams(window.location.search).get("c");
+      setActiveId(id);
+    };
+    adopt();
+    window.addEventListener("popstate", adopt);
+    return () => window.removeEventListener("popstate", adopt);
+  }, [setActiveId]);
+
+  /**
+   * Load — or clear — the transcript whenever the selected conversation
+   * changes, wherever the change came from: the address bar, the sidebar or
+   * the dashboard's list.
+   */
+  useEffect(() => {
+    let cancelled = false;
+
+    if (!activeId) {
+      // Only a switch away from a thread clears the view; the very first render
+      // of a fresh chat has nothing to clear and must not wipe a run in flight.
+      if (threadRef.current !== null) {
+        abortRef.current?.abort();
+        abortRef.current = null;
+        setMessages([]);
+        setThreadId(null);
+        setLoading(false);
+        setStatus("");
+      }
+      threadRef.current = null;
+      syncAddress(null);
+      return;
+    }
+
+    if (activeId === threadRef.current) return;
+
+    abortRef.current?.abort();
+    abortRef.current = null;
+    threadRef.current = activeId;
+    setThreadId(activeId);
+    setLoading(false);
+    setStatus("");
+    setRestoring(true);
+    syncAddress(activeId);
+
+    void loadConversation(activeId).then((stored) => {
+      if (cancelled) return;
+      setRestoring(false);
+      if (!stored) {
+        setMessages([]);
+        return;
+      }
+      setMessages(
+        stored.map((turn) => ({
+          role: turn.role,
+          content: turn.content,
+          sources: turn.sources,
+          web: turn.web,
+          groundedness: turn.groundedness as Message["groundedness"],
+          blocked: turn.blocked,
+        })),
+      );
+      setPinned(true);
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeId, loadConversation]);
+
+  /**
+   * Two shortcuts, both for the hands already on the keyboard: "/" jumps to
+   * the composer from anywhere in the page, and Escape stops a run in flight
+   * without reaching for the button that replaced Send.
+   */
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      const el = e.target as HTMLElement | null;
+      const typing =
+        el?.tagName === "INPUT" || el?.tagName === "TEXTAREA" || el?.isContentEditable;
+
+      if (e.key === "/" && !typing && !e.metaKey && !e.ctrlKey) {
+        e.preventDefault();
+        textareaRef.current?.focus();
+        return;
+      }
+
+      if (e.key === "Escape" && abortRef.current) {
+        e.preventDefault();
+        stop();
+      }
+    }
+
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
 
   // Grow the composer with its content instead of scrolling a one-line box.
   useEffect(() => {
@@ -556,6 +739,9 @@ export default function ChatPage() {
     stop();
     setMessages([]);
     setThreadId(null);
+    threadRef.current = null;
+    setActiveId(null);
+    syncAddress(null);
     setInput("");
     textareaRef.current?.focus();
   }
@@ -635,9 +821,19 @@ export default function ChatPage() {
           }
 
           switch (data.event) {
-            case "thread":
-              setThreadId(String(data.threadId));
+            case "thread": {
+              // The server names the thread on the first turn. Adopting it here
+              // is what makes the conversation resumable: it goes into the
+              // address, the sidebar's selection and the saved list at once.
+              const id = String(data.threadId);
+              setThreadId(id);
+              if (threadRef.current !== id) {
+                threadRef.current = id;
+                setActiveId(id);
+                syncAddress(id);
+              }
               break;
+            }
 
             case "status":
               setStatus(String(data.stage ?? ""));
@@ -755,6 +951,9 @@ export default function ChatPage() {
       setLoading(false);
       setStatus("");
       abortRef.current = null;
+      // The turn changed the thread's title, message count and status; the
+      // sidebar and dashboard both read that list.
+      void refreshConversations();
     }
   }
 
@@ -769,99 +968,133 @@ export default function ChatPage() {
       onDrop={onDrop}
     >
       {/* Header */}
-      <header className="glass sticky top-0 z-10 flex h-16 shrink-0 items-center justify-between gap-4 border-b border-line px-4 pl-16 lg:px-6">
+      <header className="glass sticky top-0 z-10 flex h-16 shrink-0 items-center justify-between gap-4 border-b border-border px-4 pl-16 lg:px-6">
         <div className="min-w-0">
-          <h1 className="truncate text-[15px] font-semibold tracking-tight text-ink">
-            Conversation
-          </h1>
-          <p className="truncate text-xs text-ink-3">
+          <div className="eyebrow">
+            {isEmpty ? "New conversation" : `${messages.length} messages`}
+          </div>
+          <h1 className="truncate font-display text-[15px] font-semibold text-foreground">
             {kb.documents.length === 0
-              ? "No documents indexed — answers will rely on web search"
-              : `Grounded in ${kb.documents.length} document${kb.documents.length === 1 ? "" : "s"}`}
-          </p>
+              ? "Grounded research — no corpus yet"
+              : "Grounded research, cited to source"}
+          </h1>
         </div>
 
-        <div className="flex shrink-0 items-center gap-2">
+        <div className="flex shrink-0 items-center gap-3">
+          <div className="hidden items-center gap-3 eyebrow xl:flex">
+            <span>
+              Corpus{" "}
+              <b className="font-semibold text-foreground">
+                {kb.documents.length} doc{kb.documents.length === 1 ? "" : "s"}
+              </b>
+            </span>
+            <span className="w-3 border-t border-border" />
+            <span>
+              Retrieval <b className="font-semibold text-foreground">Hybrid</b>
+            </span>
+            <span className="w-3 border-t border-border" />
+            <span>
+              Web <b className="font-semibold text-foreground">{webSearch ? "On" : "Off"}</b>
+            </span>
+          </div>
           {loading && (
             <Pill tone="accent" dot pulse className="hidden sm:inline-flex">
               {status || "Working"}
             </Pill>
           )}
-          <Button size="sm" variant="secondary" onClick={newConversation} disabled={isEmpty && !loading}>
+          <Button
+            size="sm"
+            variant="secondary"
+            onClick={newConversation}
+            disabled={isEmpty && !loading}
+          >
             <PlusIcon className="w-3.5 h-3.5" />
             <span className="hidden sm:inline">New chat</span>
           </Button>
+          <ThemeToggle />
         </div>
       </header>
 
       {/* Conversation */}
-      <main className="min-h-0 flex-1 overflow-y-auto px-4 lg:px-6">
-        <div className="mx-auto w-full max-w-3xl py-6">
-          {isEmpty ? (
+      <main
+        ref={scrollRef}
+        onScroll={onScroll}
+        className="min-h-0 flex-1 overflow-y-auto px-4 lg:px-6"
+      >
+        <div className="mx-auto w-full max-w-[72ch] py-8">
+          {restoring ? (
+            <div className="space-y-6" aria-busy="true" aria-label="Loading conversation">
+              {[0, 1, 2].map((i) => (
+                <div key={i} className="space-y-2">
+                  <div className="shimmer h-3 w-24 rounded" />
+                  <div className="shimmer h-4 w-full rounded" />
+                  <div className="shimmer h-4 w-4/5 rounded" />
+                </div>
+              ))}
+            </div>
+          ) : isEmpty ? (
             <EmptyConversation
               onPick={(text) => send(undefined, text)}
               onUpload={() => fileInputRef.current?.click()}
               hasDocuments={kb.documents.length > 0}
             />
           ) : (
-            <div className="space-y-6">
+            <div className="space-y-8">
               {messages.map((m, i) => (
-                <div key={i} className="animate-fade-up">
+                <article key={i} className="animate-rise">
                   {m.role === "user" ? (
-                    <div className="flex justify-end">
-                      <div
-                        className="max-w-[85%] rounded-2xl rounded-br-md px-4 py-2.5 text-[14px] leading-relaxed whitespace-pre-wrap"
-                        style={{ background: "var(--accent)", color: "var(--accent-ink)" }}
-                      >
+                    <div className="flex flex-col items-end">
+                      <div className="eyebrow mb-1">You</div>
+                      <div className="max-w-[85%] rounded-md bg-primary px-4 py-2.5 text-[14px] leading-relaxed text-primary-foreground whitespace-pre-wrap">
                         {m.content}
                       </div>
                     </div>
                   ) : (
-                    <div className="flex gap-3">
-                      <span
-                        className="mt-0.5 grid h-7 w-7 shrink-0 place-items-center rounded-lg"
-                        style={{ background: "var(--accent-soft)", color: "var(--accent)" }}
-                      >
-                        <SparkIcon className="w-4 h-4" />
-                      </span>
-
-                      <div className="min-w-0 flex-1">
-                        <div className="rounded-2xl rounded-tl-md border border-line bg-surface px-4 py-3.5 shadow-xs">
-                          {m.todos && m.todos.length > 0 && <PlanPanel todos={m.todos} />}
-                          {m.delegations && m.delegations.length > 0 && (
-                            <DelegationPanel delegations={m.delegations} />
-                          )}
-                          {m.trace && m.trace.length > 0 && <TracePanel trace={m.trace} />}
-
-                          {m.content ? (
-                            <SimpleMarkdown content={m.content} />
-                          ) : (
-                            loading &&
-                            i === messages.length - 1 && <TypingIndicator label={status} />
-                          )}
-
-                          {m.blocked && (
-                            <Pill tone="danger" className="mt-3">
-                              <ShieldIcon className="w-3 h-3" />
-                              Blocked by input guardrails
-                            </Pill>
-                          )}
-
-                          {m.groundedness && <GroundednessBadge g={m.groundedness} />}
-                          {(m.sources || m.web) && (
-                            <SourcesPanel sources={m.sources ?? []} web={m.web ?? []} />
-                          )}
-                        </div>
-
-                        {m.content && !loading && (
-                          <div className="mt-1 flex items-center gap-0.5 pl-1">
-                            <CopyButton text={m.content} />
-                          </div>
-                        )}
+                    <div
+                      className="min-w-0"
+                      // Only the answer still being written announces itself;
+                      // marking every message live would replay the whole
+                      // transcript on each token.
+                      aria-live={loading && i === messages.length - 1 ? "polite" : undefined}
+                      aria-busy={loading && i === messages.length - 1}
+                    >
+                      <div className="eyebrow mb-2 flex items-center gap-2">
+                        <SparkIcon className="w-3 h-3" />
+                        Agentic RAG · grounded response
                       </div>
+
+                      {m.todos && m.todos.length > 0 && <PlanPanel todos={m.todos} />}
+                      {m.delegations && m.delegations.length > 0 && (
+                        <DelegationPanel delegations={m.delegations} />
+                      )}
+                      {m.trace && m.trace.length > 0 && <TracePanel trace={m.trace} />}
+
+                      {m.content ? (
+                        <SimpleMarkdown content={m.content} />
+                      ) : (
+                        loading && i === messages.length - 1 && <TypingIndicator label={status} />
+                      )}
+
+                      {m.blocked && (
+                        <Pill tone="danger" className="mt-3">
+                          <ShieldIcon className="w-3 h-3" />
+                          Blocked by input guardrails
+                        </Pill>
+                      )}
+
+                      {m.groundedness && <GroundednessBadge g={m.groundedness} />}
+                      {(m.sources || m.web) && (
+                        <SourcesPanel sources={m.sources ?? []} web={m.web ?? []} />
+                      )}
+
+                      {m.content && !loading && (
+                        <div className="mt-2 flex items-center gap-0.5 -ml-1.5">
+                          <CopyButton text={m.content} />
+                        </div>
+                      )}
                     </div>
                   )}
-                </div>
+                </article>
               ))}
             </div>
           )}
@@ -869,9 +1102,23 @@ export default function ChatPage() {
         </div>
       </main>
 
+      {/* Follow-the-tail escape hatch, shown only when the view has drifted. */}
+      {!isEmpty && !pinned && (
+        <div className="relative z-10 h-0">
+          <button
+            type="button"
+            onClick={jumpToLatest}
+            className="absolute bottom-3 left-1/2 -translate-x-1/2 inline-flex items-center gap-1.5 rounded-full border border-border bg-card px-3 py-1.5 text-[11px] font-medium text-foreground shadow-md transition-colors hover:bg-accent animate-slide-up"
+          >
+            <ChevronIcon className="w-3 h-3 rotate-90" />
+            {loading ? "Answer still streaming" : "Jump to latest"}
+          </button>
+        </div>
+      )}
+
       {/* Composer */}
-      <footer className="glass shrink-0 border-t border-line px-4 py-3 lg:px-6">
-        <form onSubmit={send} className="mx-auto w-full max-w-3xl">
+      <footer className="glass shrink-0 border-t border-border px-4 py-3 lg:px-6">
+        <form onSubmit={send} className="mx-auto w-full max-w-[72ch]">
           <input
             ref={fileInputRef}
             type="file"
@@ -880,25 +1127,7 @@ export default function ChatPage() {
             className="hidden"
           />
 
-          <div className="flex items-end gap-2 rounded-2xl border border-line bg-surface p-1.5 shadow-sm transition-colors focus-within:border-[var(--accent)]">
-            <button
-              type="button"
-              onClick={() => fileInputRef.current?.click()}
-              disabled={kb.uploading || loading}
-              title="Attach a document"
-              aria-label="Attach a document"
-              className="grid h-9 w-9 shrink-0 place-items-center rounded-xl text-ink-3 transition-colors hover:bg-surface-hover hover:text-ink disabled:opacity-40"
-            >
-              {kb.uploading ? (
-                <span
-                  className="h-3.5 w-3.5 rounded-full border-2 border-current border-t-transparent animate-spin-slow"
-                  aria-hidden="true"
-                />
-              ) : (
-                <PaperclipIcon className="w-4 h-4" />
-              )}
-            </button>
-
+          <div className="rounded-lg border border-border bg-secondary/60 transition-[border-color] duration-200 focus-within:border-ring">
             <textarea
               ref={textareaRef}
               value={input}
@@ -909,26 +1138,57 @@ export default function ChatPage() {
                   void send();
                 }
               }}
-              rows={1}
-              placeholder="Ask a question about your documents…"
+              rows={2}
+              placeholder="Ask a grounded question about your documents…"
               aria-label="Message"
-              className="min-h-9 flex-1 resize-none bg-transparent px-1 py-2 text-[14px] leading-relaxed text-ink outline-none placeholder:text-ink-3"
+              className="min-h-18 w-full resize-none bg-transparent px-3.5 pt-3 pb-1 text-[15px] leading-relaxed text-foreground outline-none placeholder:text-muted-foreground"
             />
 
-            {loading ? (
-              <Button type="button" variant="secondary" onClick={stop} className="shrink-0">
-                <StopIcon className="w-3.5 h-3.5" />
-                Stop
-              </Button>
-            ) : (
-              <Button type="submit" variant="primary" disabled={!input.trim()} className="shrink-0">
-                <SendIcon className="w-4 h-4" />
-                <span className="hidden sm:inline">Send</span>
-              </Button>
-            )}
+            <div className="flex items-center justify-between gap-3 px-2 pb-2">
+              <div className="flex min-w-0 items-center gap-1">
+                <DocumentsTrigger
+                  onClick={() => setDocsOpen(true)}
+                  count={kb.documents.length}
+                  busy={kb.uploading}
+                />
+                {kb.documents.length === 0 && !kb.uploading && (
+                  <span className="hidden text-[12px] text-muted-foreground sm:inline">
+                    none attached
+                  </span>
+                )}
+              </div>
+
+              <div className="flex shrink-0 items-center gap-2.5">
+                <span className="hidden eyebrow sm:block">
+                  {deepAgents ? "Deep agents" : deepThinking ? "Deep research" : "Hybrid"}
+                  {webSearch ? " · Web" : ""}
+                </span>
+                {loading ? (
+                  <button
+                    type="button"
+                    onClick={stop}
+                    title="Stop generating (Esc)"
+                    aria-label="Stop generating"
+                    className="press grid size-8 place-items-center rounded-md border border-border text-foreground hover:bg-accent"
+                  >
+                    <StopIcon className="w-3.5 h-3.5" />
+                  </button>
+                ) : (
+                  <button
+                    type="submit"
+                    disabled={!input.trim()}
+                    title="Send (Enter)"
+                    aria-label="Send message"
+                    className="press grid size-8 place-items-center rounded-md bg-primary text-primary-foreground hover:opacity-90 disabled:opacity-40"
+                  >
+                    <SendIcon className="w-4 h-4" />
+                  </button>
+                )}
+              </div>
+            </div>
           </div>
 
-          <div className="mt-2 flex flex-wrap items-center gap-1.5 px-1">
+          <div className="mt-2.5 flex flex-wrap items-center gap-1.5 px-1">
             <ModeToggle
               active={webSearch}
               onClick={() => setWebSearch(!webSearch)}
@@ -962,30 +1222,38 @@ export default function ChatPage() {
                   : "Single researcher — one context does all the work"
               }
             />
-            <span className="ml-auto hidden text-[11px] text-ink-3 sm:inline">
-              <kbd className="font-mono">Enter</kbd> to send ·{" "}
-              <kbd className="font-mono">Shift + Enter</kbd> for a new line
+            <span className="ml-auto hidden items-center gap-1.5 text-[11px] text-muted-foreground sm:inline-flex">
+              <Key>{loading ? "Esc" : "/"}</Key>
+              {loading ? "to stop" : "to focus"}
+              <span className="mx-0.5 h-3 w-px bg-border" />
+              <Key>Enter</Key>
+              to send
             </span>
           </div>
 
+          <p className="mt-2 text-center text-[11px] text-muted-foreground">
+            Every answer is checked against your indexed sources.
+          </p>
+
           <p className="sr-only">
-            <kbd className="font-mono">Enter</kbd> to send ·{" "}
-            <kbd className="font-mono">Shift + Enter</kbd> for a new line · drop a file anywhere to
-            index it
+            Press slash to focus the composer, Enter to send, Shift + Enter for a new line, Escape
+            to stop a running answer, or drop a file anywhere to index it.
           </p>
         </form>
       </footer>
 
+      <DocumentsDialog open={docsOpen} onClose={() => setDocsOpen(false)} disabled={loading} />
+
       {/* Drop overlay */}
       {dragging && (
-        <div className="pointer-events-none absolute inset-0 z-20 grid place-items-center bg-bg/85 animate-fade-in">
+        <div className="pointer-events-none absolute inset-0 z-20 grid place-items-center bg-background/85 animate-fade-in">
           <div
-            className="flex flex-col items-center gap-3 rounded-2xl border-2 border-dashed px-10 py-8"
-            style={{ borderColor: "var(--accent)", background: "var(--accent-soft)" }}
+            className="flex animate-zoom-in flex-col items-center gap-3 rounded-md border-2 border-dashed px-10 py-8"
+            style={{ borderColor: "var(--accent-color)", background: "var(--accent-soft)" }}
           >
-            <UploadIcon className="w-7 h-7" style={{ color: "var(--accent)" }} />
-            <p className="text-sm font-medium text-ink">Drop to index</p>
-            <p className="text-xs text-ink-3">PDF, DOCX, TXT, Markdown or CSV</p>
+            <UploadIcon className="w-7 h-7" style={{ color: "var(--accent-color)" }} />
+            <p className="text-sm font-medium text-foreground">Drop to index</p>
+            <p className="text-xs text-muted-foreground">PDF, DOCX, TXT, Markdown or CSV</p>
           </div>
         </div>
       )}
@@ -1019,15 +1287,15 @@ function ModeToggle({
       onClick={onClick}
       title={title}
       aria-pressed={active}
-      className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] font-medium transition-colors ${
+      className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] font-medium transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring ${
         active
-          ? "border-transparent"
-          : "border-line text-ink-3 hover:bg-surface-hover hover:text-ink-2"
+          ? "border-transparent bg-primary text-primary-foreground"
+          : "border-border text-muted-foreground hover:bg-accent hover:text-foreground"
       }`}
-      style={active ? { background: "var(--accent-soft)", color: "var(--accent)" } : undefined}
     >
       {icon}
       {label}
+      <span className="sr-only">{active ? " (on)" : " (off)"}</span>
     </button>
   );
 }
@@ -1042,18 +1310,26 @@ function EmptyConversation({
   hasDocuments: boolean;
 }) {
   return (
-    <div className="py-10 text-center animate-fade-up">
-      <BrandMark className="mx-auto mb-5 h-12 w-12" />
-      <h2 className="text-xl font-semibold tracking-tight text-ink">
-        Ask anything about your documents
-      </h2>
-      <p className="mx-auto mt-2 max-w-md text-sm leading-relaxed text-ink-3">
-        The agent plans multi-step questions, searches your corpus and the web, verifies the
-        answer against what it retrieved, and cites every claim.
-      </p>
+    <div className="py-8">
+      <div className="flex items-center gap-3 eyebrow">
+        <span>Research session</span>
+        <span className="flex-1 border-t border-border" />
+        <span>{hasDocuments ? "Corpus ready" : "Corpus empty"}</span>
+      </div>
+
+      <div className="animate-rise">
+        <BrandMark className="mt-10 h-8 w-8" />
+        <h2 className="mt-5 text-balance font-display text-[clamp(2rem,4vw,2.5rem)] font-semibold leading-[1.08] text-foreground">
+          What have the indexed papers concluded?
+        </h2>
+        <p className="mt-4 max-w-[56ch] text-[15px] leading-relaxed text-muted-foreground">
+          Ask anything across your corpus. Every answer is sourced to the exact document and page
+          that supports it — citations included.
+        </p>
+      </div>
 
       {!hasDocuments && (
-        <div className="mt-6 flex justify-center">
+        <div className="mt-6">
           <Button variant="primary" onClick={onUpload}>
             <UploadIcon className="w-4 h-4" />
             Upload your first document
@@ -1061,26 +1337,24 @@ function EmptyConversation({
         </div>
       )}
 
-      <div className="mx-auto mt-8 grid max-w-2xl gap-2 sm:grid-cols-2">
-        {SUGGESTIONS.map(({ icon: Icon, text }) => (
+      <div className="stagger mt-9 grid grid-cols-1 gap-x-6 sm:grid-cols-2">
+        {SUGGESTIONS.map(({ text, hint }, index) => (
           <button
             key={text}
             type="button"
             onClick={() => onPick(text)}
-            className="group flex items-start gap-2.5 rounded-xl border border-line bg-surface p-3 text-left transition-all hover:border-[var(--line-strong)] hover:shadow-sm"
+            className="group border-t border-border py-4 text-left transition-colors hover:border-foreground"
           >
-            <span
-              className="mt-px grid h-6 w-6 shrink-0 place-items-center rounded-md transition-colors"
-              style={{ background: "var(--surface-muted)", color: "var(--ink-3)" }}
-            >
-              <Icon className="w-3.5 h-3.5" />
+            <span className="eyebrow block">0{index + 1}</span>
+            <span className="mt-1.5 block text-[14px] font-medium leading-snug text-foreground">
+              {text}
             </span>
-            <span className="text-[13px] leading-snug text-ink-2 group-hover:text-ink">{text}</span>
+            <span className="mt-1 block text-[12px] text-muted-foreground">{hint}</span>
           </button>
         ))}
       </div>
 
-      <div className="mt-8 flex items-center justify-center gap-2 text-[11px] text-ink-3">
+      <div className="mt-9 flex items-center gap-2 border-t border-border pt-4 text-[11px] text-muted-foreground">
         <DocumentIcon className="w-3.5 h-3.5" />
         Hybrid retrieval · reranking · groundedness check
       </div>

@@ -3,6 +3,7 @@ import { z } from "zod";
 import { RETRIEVAL_PROFILES, SUBAGENT_CONFIG, type ThinkingMode } from "../config";
 import { getAuxModels } from "../models";
 import { structuredInvoke } from "../structured";
+import type { ThreadScope } from "../vectorstore";
 import { hybridSearch } from "./hybrid";
 import { rerankDocuments, type RankedDocument } from "./rerank";
 
@@ -119,7 +120,14 @@ export function formatContext(docs: RankedDocument[], ordinals?: number[]): stri
  */
 export async function retrieve(
   query: string,
-  options: { history?: string; topK?: number; expand?: boolean; mode?: ThinkingMode } = {},
+  options: {
+    history?: string;
+    topK?: number;
+    expand?: boolean;
+    mode?: ThinkingMode;
+    /** Restrict retrieval to one conversation's documents. */
+    threadId?: ThreadScope;
+  } = {},
 ): Promise<RetrievalResult> {
   return withRetrievalSlot(async () => {
     const { history = "", expand = true, mode = "standard" } = options;
@@ -132,7 +140,7 @@ export async function retrieve(
     // mode to fifty candidates. Deep mode has been advertising a pool of eighty
     // and reranking fifty — the extra breadth it exists to buy was configured,
     // documented, and never reached the reranker.
-    const fused = await hybridSearch(queries, profile.FUSION_TOP_K);
+    const fused = await hybridSearch(queries, profile.FUSION_TOP_K, options.threadId);
     const ranked = await rerankDocuments(query, fused, topK);
 
     return {

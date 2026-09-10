@@ -3,6 +3,7 @@ import { MemorySaver } from "@langchain/langgraph";
 import type { BaseCheckpointSaver } from "@langchain/langgraph";
 import { GUARDRAIL_CONFIG, SUBAGENT_CONFIG, type ThinkingMode } from "../config";
 import { getModel } from "../models";
+import type { ThreadScope } from "../vectorstore";
 import { buildMiddleware } from "./middleware";
 import { buildDelegationTool } from "./subagents";
 import { buildTools, createEvidenceCollector, type EvidenceCollector } from "./tools";
@@ -293,6 +294,15 @@ export interface AgentOptions {
    * delegation controls how many contexts the work is spread across.
    */
   deepAgents?: boolean;
+  /**
+   * Restrict document retrieval to one conversation.
+   *
+   * Reaches the supervisor's tools and every research branch alike, so a
+   * delegated turn cannot widen its own scope by fanning out — the branches are
+   * where an unscoped read would be hardest to notice, since their retrieval
+   * never appears in the answer directly.
+   */
+  threadId?: ThreadScope;
 }
 
 /**
@@ -303,7 +313,7 @@ export interface AgentOptions {
  * through the checkpointer.
  */
 export function buildAgent(options: AgentOptions = {}): AgentRun {
-  const { webSearch = true, mode = "standard", deepAgents = false } = options;
+  const { webSearch = true, mode = "standard", deepAgents = false, threadId } = options;
   const collector = createEvidenceCollector();
 
   /**
@@ -329,13 +339,14 @@ export function buildAgent(options: AgentOptions = {}): AgentRun {
         resultCache,
         label: "supervisor",
         delegating: deepAgents,
+        threadId,
       }),
       // Added as an ordinary tool rather than through Deep Agents' subagent
       // middleware, because that middleware's `task` tool delegates one
       // sub-question per call and depends on the model batching several calls
       // into one message to fan out — which the providers here do not do. See
       // buildDelegationTool for the measurement.
-      ...(deepAgents ? [buildDelegationTool(collector, { webSearch, resultCache })] : []),
+      ...(deepAgents ? [buildDelegationTool(collector, { webSearch, resultCache, threadId })] : []),
     ],
     systemPrompt,
     middleware: buildMiddleware({ enableTodos: options.enableTodos, deepAgents }),

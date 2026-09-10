@@ -1,14 +1,26 @@
 import type { Metadata, Viewport } from "next";
-import { Inter, JetBrains_Mono } from "next/font/google";
+import { IBM_Plex_Sans, Inter, JetBrains_Mono } from "next/font/google";
 import { AppShell } from "./components/app-shell";
+import { ConversationsProvider } from "./components/conversations-context";
 import { KnowledgeProvider } from "./components/knowledge-context";
 import "./globals.css";
 
 // Loaded through next/font rather than an @import in the stylesheet: the CSS
 // import blocks first paint on a third-party round-trip and reintroduces the
 // flash of unstyled text that self-hosting exists to remove.
-const sans = Inter({
-  variable: "--font-ui",
+// Inter carries every piece of running text: it was drawn for screen UI at
+// small sizes, which is most of this interface. IBM Plex Sans sets headings —
+// it has enough character to separate them from body copy while keeping the
+// open apertures that make a headline legible at a glance.
+const display = IBM_Plex_Sans({
+  variable: "--font-display-family",
+  subsets: ["latin"],
+  weight: ["500", "600", "700"],
+  display: "swap",
+});
+
+const body = Inter({
+  variable: "--font-body-family",
   subsets: ["latin"],
   display: "swap",
 });
@@ -31,8 +43,8 @@ export const metadata: Metadata = {
 
 export const viewport: Viewport = {
   themeColor: [
-    { media: "(prefers-color-scheme: light)", color: "#f5f7f9" },
-    { media: "(prefers-color-scheme: dark)", color: "#0a0d12" },
+    { media: "(prefers-color-scheme: light)", color: "#f4f1ea" },
+    { media: "(prefers-color-scheme: dark)", color: "#1c1a18" },
   ],
 };
 
@@ -54,10 +66,17 @@ export default function RootLayout({
       <head>
         <script dangerouslySetInnerHTML={{ __html: THEME_SCRIPT }} />
       </head>
-      <body className={`${sans.variable} ${mono.variable} antialiased`}>
-        <KnowledgeProvider>
-          <AppShell>{children}</AppShell>
-        </KnowledgeProvider>
+      <body className={`${display.variable} ${body.variable} ${mono.variable} antialiased`}>
+        {/*
+          Conversations sit outside knowledge, because documents are scoped to a
+          conversation: the knowledge provider reads the active conversation to
+          decide which documents it is describing, so it has to be the inner one.
+        */}
+        <ConversationsProvider>
+          <KnowledgeProvider>
+            <AppShell>{children}</AppShell>
+          </KnowledgeProvider>
+        </ConversationsProvider>
       </body>
     </html>
   );

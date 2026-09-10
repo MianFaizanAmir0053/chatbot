@@ -12,6 +12,7 @@ import { z } from "zod";
 import { SUBAGENT_CONFIG } from "../config";
 import { normaliseCitations } from "../guardrails/output";
 import { getSubagentFallbackModels, getSubagentModel } from "../models";
+import type { ThreadScope } from "../vectorstore";
 import { buildTools, type EvidenceCollector } from "./tools";
 
 /**
@@ -180,6 +181,8 @@ export interface SubagentOptions {
   webSearch?: boolean;
   /** Shared result cache, so branches do not re-run each other's searches. */
   resultCache?: Map<string, Promise<string>>;
+  /** Restrict every researcher to one conversation's documents. */
+  threadId?: ThreadScope;
 }
 
 /** The researcher a delegation is addressed to. */
@@ -239,10 +242,16 @@ export function batchQualifiesForVerification(
  * compilation is local work with no network in it.
  */
 function compileResearchers(collector: EvidenceCollector, options: SubagentOptions) {
-  const { webSearch = true, resultCache } = options;
+  const { webSearch = true, resultCache, threadId } = options;
 
   const researchTools = (label: string, allowWeb: boolean) =>
-    buildTools(collector, { webSearch: allowWeb, mode: "focused", resultCache, label });
+    buildTools(collector, {
+      webSearch: allowWeb,
+      mode: "focused",
+      resultCache,
+      label,
+      threadId,
+    });
 
   // A factory rather than a literal, because `model` must be evaluated afresh
   // for every compilation: `getSubagentModel` advances the credential rotation,

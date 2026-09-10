@@ -1,6 +1,6 @@
 import { createHash } from "crypto";
 import { downloadFileFromS3 } from "../s3";
-import { getVectorStore } from "../vectorstore";
+import { getVectorStore, type ThreadScope } from "../vectorstore";
 import { invalidateSparseIndex } from "../retrieval/hybrid";
 import { chunkDocument } from "./chunk";
 import { extractDocument } from "./extract";
@@ -9,6 +9,12 @@ export interface IngestInput {
   name: string;
   key: string;
   type: string;
+  /**
+   * The conversation this upload belongs to.
+   *
+   * Absent means corpus-wide, which is what a dashboard upload is.
+   */
+  threadId?: string;
 }
 
 export interface IngestResult {
@@ -28,6 +34,18 @@ export interface IngestResult {
  */
 const ingestedHashes = new Map<string, string>();
 
+/**
+ * Dedupe identity for an upload.
+ *
+ * Keyed by conversation as well as filename, because the same file uploaded to
+ * two conversations is two documents. Keying on the name alone made the second
+ * upload look like a repeat of the first and skip ingest entirely — leaving a
+ * conversation that had plainly just been given a document unable to see it.
+ */
+function ingestKey(file: IngestInput): string {
+  return `${file.threadId ?? "*"}:${file.name}`;
+}
+
 function hashBuffer(buf: Buffer): string {
   return createHash("sha256").update(buf).digest("hex").slice(0, 32);
 }
@@ -38,7 +56,7 @@ export async function ingestFile(file: IngestInput): Promise<IngestResult> {
     const buffer = await downloadFileFromS3(file.key);
     const hash = hashBuffer(buffer);
 
-    if (ingestedHashes.get(file.name) === hash) {
+    if (ingestedHashes.get(ingestKey(file)) === hash) {
       return { source: file.name, status: "skipped", chunks: 0 };
     }
 
@@ -58,15 +76,16 @@ export async function ingestFile(file: IngestInput): Promise<IngestResult> {
       fileKey: file.key,
       fileType: file.type,
       documentTitle: file.name.replace(/\.[^.]+$/, "").replace(/[-_]+/g, " "),
+      threadId: file.threadId,
     });
 
     const store = await getVectorStore();
     // Replace rather than append, so re-uploading an edited file doesn't leave
     // stale chunks from the previous revision competing in retrieval.
-    await store.deleteBySource(file.name);
+    await store.deleteBySource(file.name, file.threadId);
     await store.addDocuments(chunks);
 
-    ingestedHashes.set(file.name, hash);
+    ingestedHashes.set(ingestKey(file), hash);
     invalidateSparseIndex();
 
     return {
@@ -91,16 +110,50 @@ export async function ingestFiles(files: IngestInput[]): Promise<IngestResult[]>
   return results;
 }
 
-export async function removeDocument(source: string): Promise<void> {
+/**
+ * Remove every document belonging to one conversation.
+ *
+ * Called when a conversation is deleted. Without it the embeddings outlive the
+ * thread that owned them: unreachable through any conversation, still counted
+ * in the corpus, still occupying the vector store and still costing whatever
+ * the store charges for them — a leak that is invisible precisely because
+ * nothing can retrieve the orphans to notice they are there.
+ *
+ * Only that conversation's own documents go. Ancestors are shared with the
+ * conversation that created them, and unscoped documents are shared with
+ * everything.
+ */
+export async function removeThreadDocuments(threadId: string): Promise<number> {
+  if (!threadId) return 0;
   const store = await getVectorStore();
-  await store.deleteBySource(source);
-  ingestedHashes.delete(source);
+  const removed = await store.deleteByThread(threadId);
+
+  for (const key of [...ingestedHashes.keys()]) {
+    if (key.startsWith(`${threadId}:`)) ingestedHashes.delete(key);
+  }
+  if (removed > 0) invalidateSparseIndex();
+  return removed;
+}
+
+export async function removeDocument(source: string, threadId?: string): Promise<void> {
+  const store = await getVectorStore();
+  await store.deleteBySource(source, threadId);
+  ingestedHashes.delete(`${threadId ?? "*"}:${source}`);
   invalidateSparseIndex();
 }
 
-export async function knowledgeBaseStatus() {
+/**
+ * What a conversation can see, or the whole corpus when unscoped.
+ *
+ * The dashboard and health checks want everything; the chat view wants only
+ * this conversation's documents plus anything unscoped.
+ */
+export async function knowledgeBaseStatus(threadId?: ThreadScope) {
   const store = await getVectorStore();
-  const [sources, count] = await Promise.all([store.listSources(), store.count()]);
+  const [sources, count] = await Promise.all([
+    store.listSources(threadId),
+    store.count(threadId),
+  ]);
   return {
     driver: store.name,
     persistent: store.persistent,

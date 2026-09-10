@@ -1,6 +1,58 @@
 "use client";
 
-import React from "react";
+import React, { useEffect, useRef, useState } from "react";
+
+/** Honours the OS "reduce motion" setting for JS-driven animation. */
+function prefersReducedMotion(): boolean {
+  return (
+    typeof window !== "undefined" &&
+    window.matchMedia("(prefers-reduced-motion: reduce)").matches
+  );
+}
+
+/**
+ * Counts from the previous value to the next one.
+ *
+ * A dashboard number that jumps has no direction: 24 replacing 18 and 24
+ * replacing 31 look identical. Rolling the digits shows which way it moved
+ * and how far, which is the only reason the number is on screen at all.
+ */
+export function useCountUp(target: number, duration = 650): number {
+  // null means "nothing in flight, render the target as given" — so a value
+  // that arrives while motion is reduced, or that never moves, needs no state
+  // write at all.
+  const [tween, setTween] = useState<number | null>(null);
+  const shownRef = useRef(target);
+  const previousRef = useRef(target);
+
+  shownRef.current = tween ?? target;
+
+  useEffect(() => {
+    const from = previousRef.current;
+    previousRef.current = target;
+    if (from === target || prefersReducedMotion()) return;
+
+    // Start from whatever is on screen, so a value that changes again mid-roll
+    // continues from there instead of snapping back.
+    const start = performance.now();
+    const origin = shownRef.current;
+    let frame = requestAnimationFrame(function tick(now: number) {
+      const t = Math.min(1, (now - start) / duration);
+      // Ease-out cubic: quick off the mark, settled at the end.
+      const eased = 1 - Math.pow(1 - t, 3);
+      if (t < 1) {
+        setTween(Math.round(origin + (target - origin) * eased));
+        frame = requestAnimationFrame(tick);
+      } else {
+        setTween(null);
+      }
+    });
+
+    return () => cancelAnimationFrame(frame);
+  }, [target, duration]);
+
+  return tween ?? target;
+}
 
 /* ------------------------------------------------------------------ *
  * Shared presentational primitives
@@ -13,8 +65,8 @@ import React from "react";
 export type Tone = "neutral" | "accent" | "success" | "warn" | "danger" | "info";
 
 const TONE_FG: Record<Tone, string> = {
-  neutral: "var(--ink-2)",
-  accent: "var(--accent)",
+  neutral: "var(--foreground)",
+  accent: "var(--accent-color)",
   success: "var(--success)",
   warn: "var(--warn)",
   danger: "var(--danger)",
@@ -54,7 +106,7 @@ export function Pill({
   return (
     <span
       title={title}
-      className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] font-medium leading-none whitespace-nowrap ${className}`}
+      className={`inline-flex items-center gap-1.5 rounded-full px-2 py-1 text-[11px] font-semibold leading-none whitespace-nowrap transition-colors ${className}`}
       style={{ background: TONE_BG[tone], color: TONE_FG[tone] }}
     >
       {dot && (
@@ -72,14 +124,19 @@ export function Card({
   children,
   className = "",
   padded = true,
+  interactive = false,
 }: {
   children: React.ReactNode;
   className?: string;
   padded?: boolean;
+  /** Adds hover feedback. Only for cards that lead somewhere or do something. */
+  interactive?: boolean;
 }) {
   return (
     <section
-      className={`rounded-xl border border-line bg-surface shadow-xs ${padded ? "p-5" : ""} ${className}`}
+      className={`rounded-md border border-border bg-card ${interactive ? "lift" : ""} ${
+        padded ? "p-4" : ""
+      } ${className}`}
     >
       {children}
     </section>
@@ -101,16 +158,15 @@ export function CardHeader({
     <header className="flex items-start justify-between gap-3 mb-4">
       <div className="flex items-center gap-2.5 min-w-0">
         {icon && (
-          <span
-            className="shrink-0 grid place-items-center w-8 h-8 rounded-lg"
-            style={{ background: "var(--accent-soft)", color: "var(--accent)" }}
-          >
+          <span className="shrink-0 grid place-items-center w-8 h-8 rounded-md bg-secondary text-foreground">
             {icon}
           </span>
         )}
         <div className="min-w-0">
-          <h2 className="text-sm font-semibold tracking-tight text-ink truncate">{title}</h2>
-          {subtitle && <p className="text-xs text-ink-3 truncate">{subtitle}</p>}
+          <h2 className="font-display text-[13px] font-semibold text-foreground truncate">
+            {title}
+          </h2>
+          {subtitle && <p className="mt-0.5 text-[11px] text-muted-foreground truncate">{subtitle}</p>}
         </div>
       </div>
       {action && <div className="shrink-0">{action}</div>}
@@ -135,26 +191,29 @@ export function Stat({
   trailing?: React.ReactNode;
 }) {
   return (
-    <div className="rounded-xl border border-line bg-surface p-4 shadow-xs">
-      <div className="flex items-center justify-between gap-2 mb-2.5">
-        <span className="text-[11px] font-medium uppercase tracking-[0.07em] text-ink-3">
-          {label}
-        </span>
+    <div className="rounded-md border border-border bg-card p-4">
+      <div className="flex items-center justify-between gap-2">
+        <span className="eyebrow">{label}</span>
         {icon && (
           <span className="shrink-0" style={{ color: TONE_FG[tone] }}>
             {icon}
           </span>
         )}
       </div>
-      <div className="flex items-baseline gap-2">
-        <span className="tnum text-2xl font-semibold tracking-tight text-ink leading-none">
-          {value}
+      <div className="mt-4 flex items-baseline gap-2">
+        <span className="tnum font-display text-2xl font-semibold text-foreground leading-none">
+          {typeof value === "number" ? <CountUp value={value} /> : value}
         </span>
         {trailing}
       </div>
-      {hint && <div className="mt-2 text-xs text-ink-3 truncate">{hint}</div>}
+      {hint && <div className="mt-1 text-[11px] text-muted-foreground truncate">{hint}</div>}
     </div>
   );
+}
+
+/** Renders a number that rolls to its new value when it changes. */
+export function CountUp({ value }: { value: number }) {
+  return <>{useCountUp(value).toLocaleString()}</>;
 }
 
 /** A label/value row inside a subsystem card. */
@@ -168,10 +227,10 @@ export function Row({
   mono?: boolean;
 }) {
   return (
-    <div className="flex items-center justify-between gap-3 py-2 border-b border-line last:border-0">
-      <span className="text-xs text-ink-3 shrink-0">{label}</span>
+    <div className="flex items-center justify-between gap-3 py-2 border-b border-border last:border-0">
+      <span className="text-[11px] text-muted-foreground shrink-0">{label}</span>
       <span
-        className={`text-xs text-ink-2 text-right min-w-0 truncate ${mono ? "font-mono" : "font-medium"}`}
+        className={`text-[11px] text-foreground text-right min-w-0 truncate ${mono ? "font-mono" : "font-medium"}`}
       >
         {children}
       </span>
@@ -182,15 +241,19 @@ export function Row({
 /** Proportional bar used for share-of-index in the document table. */
 export function Meter({ value, tone = "accent" }: { value: number; tone?: Tone }) {
   const pct = Math.max(0, Math.min(1, value)) * 100;
+  // Painted at zero on mount so the first render animates out to its share
+  // rather than appearing already full.
+  const [grown, setGrown] = useState(false);
+  useEffect(() => {
+    const frame = requestAnimationFrame(() => setGrown(true));
+    return () => cancelAnimationFrame(frame);
+  }, []);
+
   return (
-    <div
-      className="h-1.5 w-full rounded-full overflow-hidden"
-      style={{ background: "var(--surface-hover)" }}
-      role="presentation"
-    >
+    <div className="h-1.5 w-full rounded-full overflow-hidden bg-secondary" role="presentation">
       <div
-        className="h-full rounded-full transition-[width] duration-500"
-        style={{ width: `${pct}%`, background: TONE_FG[tone] }}
+        className="h-full rounded-full transition-[width] duration-700 ease-[cubic-bezier(0.32,0.72,0,1)]"
+        style={{ width: grown ? `${pct}%` : "0%", background: TONE_FG[tone] }}
       />
     </div>
   );
@@ -208,15 +271,16 @@ export function Button({
   style,
   ...rest
 }: ButtonProps) {
-  const sizing = size === "sm" ? "h-8 px-3 text-xs gap-1.5" : "h-9 px-3.5 text-[13px] gap-2";
+  const sizing = size === "sm" ? "h-8 px-3 text-[12px] gap-1.5" : "h-9 px-3.5 text-[13px] gap-2";
   const base =
-    "inline-flex items-center justify-center rounded-lg font-medium transition-colors duration-150 " +
+    "press inline-flex items-center justify-center rounded-md font-medium " +
+    "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring " +
     "disabled:opacity-45 disabled:pointer-events-none select-none";
 
   const variants: Record<string, string> = {
-    primary: "text-[var(--accent-ink)] hover:brightness-[1.06]",
-    secondary: "border border-line text-ink-2 hover:bg-surface-hover hover:text-ink",
-    ghost: "text-ink-3 hover:bg-surface-hover hover:text-ink",
+    primary: "bg-primary text-primary-foreground hover:opacity-90",
+    secondary: "border border-border bg-secondary/60 text-foreground hover:bg-accent",
+    ghost: "text-muted-foreground hover:bg-accent hover:text-foreground",
     danger: "text-[var(--danger)] hover:bg-[var(--danger-soft)]",
   };
 
@@ -224,11 +288,7 @@ export function Button({
     <button
       {...rest}
       className={`${base} ${sizing} ${variants[variant]} ${className}`}
-      style={{
-        ...(variant === "primary" ? { background: "var(--accent)" } : null),
-        ...(variant === "secondary" ? { background: "var(--surface)" } : null),
-        ...style,
-      }}
+      style={style}
     />
   );
 }
@@ -243,9 +303,7 @@ export function SectionTitle({
 }) {
   return (
     <div className="flex items-end justify-between gap-3 mb-3">
-      <h2 className="text-[11px] font-semibold uppercase tracking-[0.09em] text-ink-3">
-        {children}
-      </h2>
+      <h2 className="eyebrow font-semibold">{children}</h2>
       {action}
     </div>
   );
@@ -269,15 +327,16 @@ export function EmptyState({
   return (
     <div className="text-center py-10 px-6">
       {icon && (
-        <span
-          className="mx-auto mb-3 grid place-items-center w-11 h-11 rounded-xl"
-          style={{ background: "var(--surface-muted)", color: "var(--ink-3)" }}
-        >
+        <span className="mx-auto mb-3 grid place-items-center w-10 h-10 rounded-md bg-secondary text-muted-foreground">
           {icon}
         </span>
       )}
-      <p className="text-sm font-medium text-ink">{title}</p>
-      {body && <p className="mt-1 text-xs text-ink-3 max-w-xs mx-auto leading-relaxed">{body}</p>}
+      <p className="font-display text-[13px] font-semibold text-foreground">{title}</p>
+      {body && (
+        <p className="mt-1 text-[11px] text-muted-foreground max-w-xs mx-auto leading-relaxed">
+          {body}
+        </p>
+      )}
       {action && <div className="mt-4 flex justify-center">{action}</div>}
     </div>
   );

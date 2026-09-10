@@ -42,6 +42,13 @@ export async function POST(req: NextRequest) {
 
     const formData = await req.formData();
     const file = formData.get("file");
+    // Which conversation this document belongs to. Absent means corpus-wide,
+    // which is what an upload from the dashboard is.
+    const threadField = formData.get("threadId");
+    const threadId =
+      typeof threadField === "string" && /^[a-zA-Z0-9_-]{1,64}$/.test(threadField)
+        ? threadField
+        : undefined;
 
     if (!file || typeof file === "string") {
       return NextResponse.json({ error: "No file provided" }, { status: 400 });
@@ -74,11 +81,11 @@ export async function POST(req: NextRequest) {
 
     // Ingest immediately so the document is queryable the moment upload returns,
     // rather than on the user's next message.
-    const ingest = await ingestFile({ name: file.name, key, type: file.type });
+    const ingest = await ingestFile({ name: file.name, key, type: file.type, threadId });
 
     return NextResponse.json({
       success: ingest.status !== "failed",
-      file: { name: file.name, size: file.size, type: file.type, key, url },
+      file: { name: file.name, size: file.size, type: file.type, key, url, threadId },
       ingest,
     });
   } catch (error) {

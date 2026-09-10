@@ -61,10 +61,12 @@ export function ThemeToggle() {
       onClick={() => applyTheme(next)}
       title={`Theme: ${LABEL[theme]} — switch to ${LABEL[next]}`}
       aria-label={`Theme: ${LABEL[theme]}. Switch to ${LABEL[next]}.`}
-      className="inline-flex h-7 items-center gap-1.5 rounded-lg px-2 text-[11px] font-medium text-ink-3 transition-colors hover:bg-surface-hover hover:text-ink"
+      className="press grid h-8 w-8 place-items-center rounded-md border border-border text-muted-foreground hover:bg-accent hover:text-foreground"
     >
-      {theme === "dark" ? <MoonIcon className="w-3.5 h-3.5" /> : <SunIcon className="w-3.5 h-3.5" />}
-      {LABEL[theme]}
+      {/* Keyed so React remounts the icon and the fade plays on every change. */}
+      <span key={theme} className="grid animate-pop place-items-center">
+        {theme === "dark" ? <MoonIcon className="w-4 h-4" /> : <SunIcon className="w-4 h-4" />}
+      </span>
     </button>
   );
 }

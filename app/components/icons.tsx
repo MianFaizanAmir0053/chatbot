@@ -305,7 +305,7 @@ export function LinkIcon(p: IconProps) {
 export function BrandMark({ className = "w-9 h-9" }: { className?: string }) {
   return (
     <svg className={className} viewBox="0 0 40 40" fill="none" aria-hidden="true">
-      <rect width="40" height="40" rx="11" fill="var(--accent)" />
+      <rect width="40" height="40" rx="6" fill="var(--accent-color)" />
       <path
         d="M12 13.5h11M12 20h16M12 26.5h8"
         stroke="var(--accent-ink)"
@@ -334,6 +334,34 @@ export function NetworkIcon(p: IconProps) {
       <circle cx="12" cy="19.5" r="2.2" />
       <circle cx="19.5" cy="19.5" r="2.2" />
       <path d="M12 6.7v3.6M4.5 17.3v-1.6a2 2 0 0 1 2-2h11a2 2 0 0 1 2 2v1.6M12 13.7v3.6" />
+    </Svg>
+  );
+}
+
+/** Rename. A pencil rather than a gear: it edits one field, not settings. */
+export function PencilIcon(p: IconProps) {
+  return (
+    <Svg {...p}>
+      <path d="M11 4.5H6.5A2.5 2.5 0 0 0 4 7v10.5A2.5 2.5 0 0 0 6.5 20H17a2.5 2.5 0 0 0 2.5-2.5V13" />
+      <path d="M17.6 3.9a1.9 1.9 0 0 1 2.7 2.7L12.5 14.4l-3.4.8.8-3.4Z" />
+    </Svg>
+  );
+}
+
+/**
+ * Fork a conversation: one line branching into two.
+ *
+ * Not the copy icon, which reads as duplication into the clipboard. A fork keeps
+ * a relationship with what it came from — it inherits that conversation's
+ * documents — and the branch shape is what carries that.
+ */
+export function ForkIcon(p: IconProps) {
+  return (
+    <Svg {...p}>
+      <circle cx="6.5" cy="5" r="2.2" />
+      <circle cx="6.5" cy="19" r="2.2" />
+      <circle cx="17.5" cy="12" r="2.2" />
+      <path d="M6.5 7.2v9.6M8.7 5.6c4 .7 6.1 2.6 6.8 5.9M8.7 18.4c4-.7 6.1-2.6 6.8-5.9" />
     </Svg>
   );
 }

@@ -4,7 +4,7 @@ import { Document } from "@langchain/core/documents";
 import type { VectorStore } from "@langchain/core/vectorstores";
 import { EMBEDDING_CONFIG, env } from "../config";
 import { getEmbeddings } from "../models";
-import type { VectorStoreDriver } from "./index";
+import { scopeIds, type ThreadScope, type VectorStoreDriver } from "./index";
 
 /**
  * Qdrant-backed persistent vector store.
@@ -89,6 +89,17 @@ export class QdrantDriver implements VectorStoreDriver {
     } catch {
       // Already exists — Qdrant returns 4xx rather than being idempotent here.
     }
+    try {
+      // Scoped retrieval filters on this on every search, so it must be
+      // indexed; without it Qdrant falls back to scanning payloads and the
+      // filter costs more than the search.
+      await this.client.createPayloadIndex(this.collection, {
+        field_name: "metadata.threadId",
+        field_schema: "keyword",
+      });
+    } catch {
+      /* already exists */
+    }
   }
 
   async addDocuments(docs: Document[]): Promise<number> {
@@ -103,15 +114,62 @@ export class QdrantDriver implements VectorStoreDriver {
     return docs.length;
   }
 
-  async similaritySearchWithScore(query: string, k: number): Promise<[Document, number][]> {
+  async similaritySearchWithScore(
+    query: string,
+    k: number,
+    threadId?: ThreadScope,
+  ): Promise<[Document, number][]> {
     const store = await this.getStore();
-    return store.similaritySearchWithScore(query, k);
+    const filter = this.scopeFilter(threadId);
+    // Filtering inside Qdrant rather than after the fact: a post-hoc filter
+    // asks for k results and then throws some away, so a conversation with few
+    // documents silently gets fewer passages than it asked for — worst exactly
+    // when it has least to work with.
+    return store.similaritySearchWithScore(query, k, filter);
   }
 
-  async getAllDocuments(): Promise<Document[]> {
+  /**
+   * Qdrant filter for a scope, or undefined for the whole corpus.
+   *
+   * "This conversation OR unscoped" rather than a plain equality, so documents
+   * ingested before scoping existed stay visible instead of disappearing.
+   * Qdrant expresses absence as IsEmpty, which has no shorthand in a match.
+   */
+  private scopeFilter(threadId?: ThreadScope) {
+    const ids = scopeIds(threadId);
+    if (ids.length === 0) return undefined;
+    return {
+      should: [
+        // `match: { any }` rather than one clause per id: the ancestor chain of
+        // a deep fork would otherwise grow the filter without bound.
+        { key: "metadata.threadId", match: { any: ids } },
+        { is_empty: { key: "metadata.threadId" } },
+      ],
+    };
+  }
+
+  async deleteByThread(threadId: string): Promise<number> {
+    await this.getStore();
+    // Counted before deleting: Qdrant's delete reports an operation status
+    // rather than how many points it matched, and the caller wants to tell the
+    // user what was removed.
+    const filter = { must: [{ key: "metadata.threadId", match: { value: threadId } }] };
+    let removed = 0;
+    try {
+      const res = await this.client.count(this.collection, { exact: true, filter });
+      removed = res.count;
+    } catch {
+      /* count is advisory; the delete still runs */
+    }
+    await this.client.delete(this.collection, { filter, wait: true });
+    return removed;
+  }
+
+  async getAllDocuments(threadId?: ThreadScope): Promise<Document[]> {
     await this.getStore();
     const docs: Document[] = [];
     let offset: string | number | undefined | null = undefined;
+    const filter = this.scopeFilter(threadId);
 
     // Scroll the whole collection; BM25 needs the full corpus in memory.
     for (;;) {
@@ -120,6 +178,7 @@ export class QdrantDriver implements VectorStoreDriver {
         offset: offset ?? undefined,
         with_payload: true,
         with_vector: false,
+        ...(filter ? { filter } : {}),
       });
       for (const point of res.points) {
         const payload = (point.payload ?? {}) as Record<string, unknown>;
@@ -136,16 +195,21 @@ export class QdrantDriver implements VectorStoreDriver {
     return docs;
   }
 
-  async deleteBySource(source: string): Promise<void> {
+  async deleteBySource(source: string, threadId?: ThreadScope): Promise<void> {
     await this.getStore();
-    await this.client.delete(this.collection, {
-      filter: { must: [{ key: "metadata.source", match: { value: source } }] },
-      wait: true,
-    });
+    // Scoped deletes match the thread exactly — not "thread or unscoped" —
+    // because removing a document from one conversation must never reach the
+    // shared corpus that every other conversation can also see.
+    const must: Array<Record<string, unknown>> = [
+      { key: "metadata.source", match: { value: source } },
+    ];
+    if (threadId) must.push({ key: "metadata.threadId", match: { value: threadId } });
+
+    await this.client.delete(this.collection, { filter: { must }, wait: true });
   }
 
-  async listSources(): Promise<Array<{ source: string; chunks: number }>> {
-    const docs = await this.getAllDocuments();
+  async listSources(threadId?: ThreadScope): Promise<Array<{ source: string; chunks: number }>> {
+    const docs = await this.getAllDocuments(threadId);
     const counts = new Map<string, number>();
     for (const d of docs) {
       const src = String(d.metadata?.source ?? "unknown");
@@ -154,10 +218,14 @@ export class QdrantDriver implements VectorStoreDriver {
     return [...counts.entries()].map(([source, chunks]) => ({ source, chunks }));
   }
 
-  async count(): Promise<number> {
+  async count(threadId?: ThreadScope): Promise<number> {
     try {
       await this.getStore();
-      const res = await this.client.count(this.collection, { exact: true });
+      const filter = this.scopeFilter(threadId);
+      const res = await this.client.count(this.collection, {
+        exact: true,
+        ...(filter ? { filter } : {}),
+      });
       return res.count;
     } catch {
       return 0;

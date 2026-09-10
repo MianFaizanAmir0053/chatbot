@@ -114,6 +114,20 @@ export interface ChunkOptions {
   fileKey?: string;
   fileType?: string;
   documentTitle?: string;
+  /**
+   * The conversation this document belongs to.
+   *
+   * Stamped on every chunk because it is the only place scoping can live: the
+   * vector store holds chunks, retrieval reads chunks, and a filter needs
+   * something on the chunk to match. Recorded per chunk rather than in a
+   * side table so a document cannot end up in the store without its owner —
+   * there is no second write to forget.
+   *
+   * Optional so a document can still be corpus-wide. Chunks without a
+   * threadId are visible from every conversation, which is what the
+   * pre-scoping corpus already is.
+   */
+  threadId?: string;
 }
 
 /**
@@ -177,6 +191,7 @@ export async function chunkDocument(
           metadata: {
             originalText: piece,
             source: options.source,
+            threadId: options.threadId,
             fileKey: options.fileKey,
             fileType: options.fileType,
             section: section.heading,

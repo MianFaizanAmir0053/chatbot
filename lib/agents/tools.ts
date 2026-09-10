@@ -1,6 +1,7 @@
 import { tool } from "@langchain/core/tools";
 import { z } from "zod";
 import type { ThinkingMode } from "../config";
+import type { ThreadScope } from "../vectorstore";
 import { knowledgeBaseStatus } from "../ingest/pipeline";
 import { formatContext, retrieve } from "../retrieval/pipeline";
 import type { RankedDocument } from "../retrieval/rerank";
@@ -99,6 +100,15 @@ export interface ToolOptions {
   /** Names the tool set in repeat-guard logs, so a noisy branch is identifiable. */
   label?: string;
   /**
+   * Restrict every document tool to one conversation.
+   *
+   * Passed down to each tool rather than read from ambient state, because a
+   * delegated turn runs several branches at once and they must all see the
+   * same conversation — an ambient value would be whatever the last request
+   * set it to.
+   */
+  threadId?: ThreadScope;
+  /**
    * Build the tool set for a *delegating* supervisor: planning only, no retrieval.
    *
    * Withholding `search_documents` is what actually makes delegation happen, and
@@ -192,7 +202,12 @@ export function buildTools(collector: EvidenceCollector, options: ToolOptions = 
       // Dropping it removes a model call and roughly two thirds of the
       // embedding calls per search, which is what turns the concurrency into
       // wall-clock.
-      const result = await retrieve(query, { topK, mode, expand: mode !== "focused" });
+      const result = await retrieve(query, {
+        topK,
+        mode,
+        expand: mode !== "focused",
+        threadId: options.threadId,
+      });
       collector.searches.push(query);
 
       if (result.documents.length === 0) return NO_RESULTS;
@@ -225,7 +240,7 @@ export function buildTools(collector: EvidenceCollector, options: ToolOptions = 
 
   const listDocuments = tool(
     guarded("list_documents", async () => {
-      const status = await knowledgeBaseStatus();
+      const status = await knowledgeBaseStatus(options.threadId);
       if (status.documents.length === 0) {
         return "The knowledge base is empty. No documents have been uploaded yet.";
       }

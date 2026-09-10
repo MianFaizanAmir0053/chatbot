@@ -45,3 +45,6 @@ next-env.d.ts
 
 # agent skill symlinks (machine-specific absolute paths; .agents/ holds the real files)
 .claude/skills/
+
+# saved conversations (local transcript store)
+.data/

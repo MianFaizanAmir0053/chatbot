@@ -517,6 +517,8 @@ export default function ChatPage() {
   const {
     activeId,
     setActiveId,
+    isUnsaved,
+    markSaved,
     load: loadConversation,
     refresh: refreshConversations,
   } = useConversations();
@@ -613,8 +615,19 @@ export default function ChatPage() {
     setThreadId(activeId);
     setLoading(false);
     setStatus("");
-    setRestoring(true);
     syncAddress(activeId);
+
+    // A conversation this client just minted — by attaching a document before
+    // sending anything — has no stored transcript yet. Fetching it would 404 and
+    // flash "restoring" over an empty chat, so the load is skipped rather than
+    // its failure handled.
+    if (isUnsaved(activeId)) {
+      setMessages([]);
+      setRestoring(false);
+      return;
+    }
+
+    setRestoring(true);
 
     void loadConversation(activeId).then((stored) => {
       if (cancelled) return;
@@ -639,7 +652,7 @@ export default function ChatPage() {
     return () => {
       cancelled = true;
     };
-  }, [activeId, loadConversation]);
+  }, [activeId, loadConversation, isUnsaved]);
 
   /**
    * Two shortcuts, both for the hands already on the keyboard: "/" jumps to
@@ -826,6 +839,9 @@ export default function ChatPage() {
               // is what makes the conversation resumable: it goes into the
               // address, the sidebar's selection and the saved list at once.
               const id = String(data.threadId);
+              // Stored server-side from this point, so reopening it later should
+              // fetch the transcript rather than assume an empty chat.
+              markSaved(id);
               setThreadId(id);
               if (threadRef.current !== id) {
                 threadRef.current = id;

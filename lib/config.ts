@@ -135,6 +135,14 @@ const EnvSchema = z.object({
   TAVILY_API_KEY: z.string().optional(),
 
   // --- Observability ---
+  /**
+   * Conversation storage. Durable across restarts and shared between instances,
+   * neither of which the JSON-file fallback can offer: most serverless targets
+   * have a read-only disk, where that fallback silently degrades to memory and
+   * loses every conversation when the instance recycles.
+   */
+  MONGODB_URI: z.string().optional(),
+
   LANGSMITH_TRACING: z.string().optional(),
   LANGSMITH_API_KEY: z.string().optional(),
   LANGSMITH_PROJECT: z.string().default("chatbot-agentic-rag"),

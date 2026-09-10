@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { activeSearchProvider } from "@/lib/agents/websearch";
+import { conversationStoreInfo } from "@/lib/conversations/store";
 import {
   COHERE_API_KEYS,
   LLM_PROVIDERS,
@@ -120,6 +121,11 @@ export async function GET() {
     injectionDetection: true,
     groundednessCheck: true,
   };
+
+  // Reported because the fallback engages silently: a database that is
+  // unreachable at boot costs durability, and on a read-only filesystem the
+  // fallback keeps conversations in memory only, losing them on every restart.
+  checks.conversations = await conversationStoreInfo();
 
   checks.observability = {
     langsmith: features.tracing ? env.LANGSMITH_PROJECT : "disabled",

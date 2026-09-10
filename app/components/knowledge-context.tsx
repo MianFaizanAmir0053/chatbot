@@ -25,7 +25,21 @@ import { useConversations } from "./conversations-context";
  * any one conversation.
  */
 
-export type KnowledgeDoc = { source: string; chunks: number };
+export type KnowledgeDoc = {
+  source: string;
+  chunks: number;
+  /** The conversation that uploaded it. Absent means corpus-wide. */
+  threadId?: string;
+  /**
+   * True when this conversation can read the document but does not own it —
+   * inherited from the conversation it was forked from, or corpus-wide.
+   *
+   * The distinction is not cosmetic: a delete scoped to this conversation
+   * matches nothing for such a document, so offering one would fail silently
+   * and the row would reappear on the next refresh.
+   */
+  inherited?: boolean;
+};
 
 export type UploadOutcome = {
   ok: boolean;
@@ -89,7 +103,12 @@ export function KnowledgeProvider({ children }: { children: React.ReactNode }) {
 
       if (!scopedRes.ok) throw new Error(`HTTP ${scopedRes.status}`);
       const data = await scopedRes.json();
-      setDocuments(data.documents ?? []);
+      // Marked here rather than in each surface, so the rule lives in one place.
+      const scoped: KnowledgeDoc[] = (data.documents ?? []).map((d: KnowledgeDoc) => ({
+        ...d,
+        inherited: !activeId || d.threadId !== activeId,
+      }));
+      setDocuments(scoped);
       setTotalChunks(data.totalChunks ?? 0);
       setDriver(data.driver ?? null);
       setPersistent(Boolean(data.persistent));
@@ -167,10 +186,27 @@ export function KnowledgeProvider({ children }: { children: React.ReactNode }) {
     [refresh, ensureActiveId],
   );
 
+  /**
+   * Remove a document from the open conversation.
+   *
+   * Refuses an inherited one instead of issuing a delete that would match
+   * nothing. Silently doing nothing is the worse failure: the row disappears
+   * optimistically and returns on the next refresh, which reads as a bug rather
+   * than as a rule.
+   */
   const remove = useCallback(
     async (source: string) => {
       // Drop it locally first so the list does not sit there during the
       // round-trip; refresh reconciles against the server either way.
+      const target = documents.find((d) => d.source === source);
+      if (target?.inherited) {
+        setError(
+          `"${source}" belongs to the conversation this one was forked from. ` +
+            "Remove it there, or delete that conversation.",
+        );
+        return;
+      }
+
       setDocuments((prev) => prev.filter((d) => d.source !== source));
       // Scoped, so removing a document here cannot empty an identically-named
       // one from another conversation.
@@ -179,7 +215,7 @@ export function KnowledgeProvider({ children }: { children: React.ReactNode }) {
       await fetch(`/api/documents?${query.toString()}`, { method: "DELETE" });
       await refresh();
     },
-    [refresh, activeId],
+    [refresh, activeId, documents],
   );
 
   const value = useMemo<KnowledgeState>(

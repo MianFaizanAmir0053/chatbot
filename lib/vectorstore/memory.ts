@@ -2,7 +2,13 @@ import { MemoryVectorStore } from "@langchain/classic/vectorstores/memory";
 import { Document } from "@langchain/core/documents";
 import type { VectorStore } from "@langchain/core/vectorstores";
 import { getEmbeddings } from "../models";
-import { scopeIds, type ThreadScope, type VectorStoreDriver } from "./index";
+import {
+  scopeIds,
+  summariseSources,
+  type DocumentSummary,
+  type ThreadScope,
+  type VectorStoreDriver,
+} from "./index";
 
 /**
  * Non-persistent fallback used only when Qdrant is unreachable.
@@ -86,14 +92,8 @@ export class MemoryDriver implements VectorStoreDriver {
     if (this.docs.length > 0) await this.store.addDocuments(this.docs);
   }
 
-  async listSources(threadId?: ThreadScope): Promise<Array<{ source: string; chunks: number }>> {
-    const counts = new Map<string, number>();
-    for (const d of this.docs) {
-      if (!this.inScope(d, threadId)) continue;
-      const src = String(d.metadata?.source ?? "unknown");
-      counts.set(src, (counts.get(src) ?? 0) + 1);
-    }
-    return [...counts.entries()].map(([source, chunks]) => ({ source, chunks }));
+  async listSources(threadId?: ThreadScope): Promise<DocumentSummary[]> {
+    return summariseSources(this.docs.filter((d) => this.inScope(d, threadId)));
   }
 
   async count(threadId?: ThreadScope): Promise<number> {

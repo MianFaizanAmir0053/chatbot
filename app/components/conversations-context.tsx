@@ -84,6 +84,17 @@ type ConversationsState = {
    * upload unscoped.
    */
   ensureActiveId: () => string;
+  /**
+   * True for a conversation this client minted that the server has not stored.
+   *
+   * Attaching a document before saying anything creates the conversation id
+   * locally, so the chat view would try to fetch a transcript that does not
+   * exist — a 404 and a "restoring" flash on what is plainly a new, empty chat.
+   * Asking first avoids the request rather than handling its failure.
+   */
+  isUnsaved: (id: string) => boolean;
+  /** Called once the server has stored the conversation, so it can be loaded. */
+  markSaved: (id: string) => void;
   refresh: () => Promise<void>;
   load: (id: string) => Promise<StoredMessage[] | null>;
   /**
@@ -119,6 +130,13 @@ export function ConversationsProvider({ children }: { children: React.ReactNode 
    * a set, so the ref is the value of record and the state exists to re-render.
    */
   const activeRef = useRef<string | null>(null);
+  /**
+   * Ids minted here that the server has not seen yet.
+   *
+   * A ref rather than state: it is read during the same tick an id is created
+   * and never affects rendering on its own.
+   */
+  const unsavedRef = useRef<Set<string>>(new Set());
 
   const refresh = useCallback(async () => {
     try {
@@ -158,8 +176,15 @@ export function ConversationsProvider({ children }: { children: React.ReactNode 
         ? crypto.randomUUID()
         : `c-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
     activeRef.current = created;
+    unsavedRef.current.add(created);
     setActiveId(created);
     return created;
+  }, []);
+
+  const isUnsaved = useCallback((id: string) => unsavedRef.current.has(id), []);
+
+  const markSaved = useCallback((id: string) => {
+    unsavedRef.current.delete(id);
   }, []);
 
   const remove = useCallback(async (id: string): Promise<{ chunksRemoved: number }> => {
@@ -243,6 +268,8 @@ export function ConversationsProvider({ children }: { children: React.ReactNode 
       activeId,
       setActiveId: selectActive,
       ensureActiveId,
+      isUnsaved,
+      markSaved,
       refresh,
       load,
       remove,
@@ -256,6 +283,8 @@ export function ConversationsProvider({ children }: { children: React.ReactNode 
       activeId,
       selectActive,
       ensureActiveId,
+      isUnsaved,
+      markSaved,
       refresh,
       load,
       remove,

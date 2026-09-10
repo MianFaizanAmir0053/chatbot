@@ -4,7 +4,13 @@ import { Document } from "@langchain/core/documents";
 import type { VectorStore } from "@langchain/core/vectorstores";
 import { EMBEDDING_CONFIG, env } from "../config";
 import { getEmbeddings } from "../models";
-import { scopeIds, type ThreadScope, type VectorStoreDriver } from "./index";
+import {
+  scopeIds,
+  summariseSources,
+  type DocumentSummary,
+  type ThreadScope,
+  type VectorStoreDriver,
+} from "./index";
 
 /**
  * Qdrant-backed persistent vector store.
@@ -208,14 +214,8 @@ export class QdrantDriver implements VectorStoreDriver {
     await this.client.delete(this.collection, { filter: { must }, wait: true });
   }
 
-  async listSources(threadId?: ThreadScope): Promise<Array<{ source: string; chunks: number }>> {
-    const docs = await this.getAllDocuments(threadId);
-    const counts = new Map<string, number>();
-    for (const d of docs) {
-      const src = String(d.metadata?.source ?? "unknown");
-      counts.set(src, (counts.get(src) ?? 0) + 1);
-    }
-    return [...counts.entries()].map(([source, chunks]) => ({ source, chunks }));
+  async listSources(threadId?: ThreadScope): Promise<DocumentSummary[]> {
+    return summariseSources(await this.getAllDocuments(threadId));
   }
 
   async count(threadId?: ThreadScope): Promise<number> {

@@ -143,26 +143,51 @@ export function DocumentsDialog({
             <ul className="space-y-1.5">
               {kb.documents.map((doc) => (
                 <li
-                  key={doc.source}
+                  key={`${doc.threadId ?? "shared"}:${doc.source}`}
                   className="group flex items-center gap-2.5 rounded-md border border-border bg-secondary/50 px-2.5 py-2"
                 >
                   <DocumentIcon className="w-4 h-4 shrink-0 text-muted-foreground" />
                   <span className="min-w-0 flex-1 truncate text-[13px] text-foreground" title={doc.source}>
                     {doc.source}
                   </span>
+                  {/* Says where a document came from when it is not this chat's
+                      own. Without it the list looks uniform while behaving
+                      differently: these cannot be removed from here, and a user
+                      who does not know that reads the refusal as a fault. */}
+                  {doc.inherited && (
+                    <span
+                      className="shrink-0 rounded px-1 text-[10px] font-medium text-muted-foreground"
+                      style={{ background: "var(--accent)" }}
+                      title={
+                        doc.threadId
+                          ? "Inherited from the conversation this chat was forked from"
+                          : "Available to every conversation"
+                      }
+                    >
+                      {doc.threadId ? "inherited" : "shared"}
+                    </span>
+                  )}
                   <span className="tnum shrink-0 text-[11px] text-muted-foreground">
                     {doc.chunks} passage{doc.chunks === 1 ? "" : "s"}
                   </span>
-                  <button
-                    type="button"
-                    onClick={() => void kb.remove(doc.source)}
-                    title={`Remove ${doc.source} from this chat`}
-                    aria-label={`Remove ${doc.source} from this chat`}
-                    className="press grid size-6 shrink-0 place-items-center rounded text-muted-foreground opacity-0 transition-opacity hover:bg-accent focus-visible:opacity-100 group-hover:opacity-100"
-                    style={{ color: "var(--danger, currentColor)" }}
-                  >
-                    <TrashIcon className="w-3.5 h-3.5" />
-                  </button>
+                  {/* Only offered for documents this conversation owns. A delete
+                      scoped to this chat matches nothing for an inherited one,
+                      so the button would remove the row optimistically and the
+                      next refresh would put it back. */}
+                  {doc.inherited ? (
+                    <span className="size-6 shrink-0" aria-hidden="true" />
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => void kb.remove(doc.source)}
+                      title={`Remove ${doc.source} from this chat`}
+                      aria-label={`Remove ${doc.source} from this chat`}
+                      className="press grid size-6 shrink-0 place-items-center rounded text-muted-foreground opacity-0 transition-opacity hover:bg-accent focus-visible:opacity-100 group-hover:opacity-100"
+                      style={{ color: "var(--danger, currentColor)" }}
+                    >
+                      <TrashIcon className="w-3.5 h-3.5" />
+                    </button>
+                  )}
                 </li>
               ))}
             </ul>

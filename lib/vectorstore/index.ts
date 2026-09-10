@@ -35,6 +35,41 @@ export function scopeIds(scope: ThreadScope): string[] {
   return (Array.isArray(scope) ? scope : [scope]).filter(Boolean);
 }
 
+export interface DocumentSummary {
+  source: string;
+  chunks: number;
+  /** The conversation that uploaded it, or undefined for a corpus-wide document. */
+  threadId?: string;
+}
+
+/**
+ * Group chunks into one entry per document per owner.
+ *
+ * Shared by both drivers so the grouping rule cannot drift between them — the
+ * in-memory store is the fallback for an unreachable Qdrant, and a difference
+ * here would show up only in that degraded state, where it is hardest to spot.
+ *
+ * Keyed on owner as well as source, because the same filename in two
+ * conversations is two documents. Merging them would report one entry with a
+ * combined chunk count and no single owner, and a delete against that entry
+ * would silently reach the wrong conversation's copy.
+ */
+export function summariseSources(docs: Document[]): DocumentSummary[] {
+  const groups = new Map<string, DocumentSummary>();
+
+  for (const doc of docs) {
+    const source = String(doc.metadata?.source ?? "unknown");
+    const owner = doc.metadata?.threadId ? String(doc.metadata.threadId) : undefined;
+    const key = `${owner ?? ""}|${source}`;
+
+    const existing = groups.get(key);
+    if (existing) existing.chunks += 1;
+    else groups.set(key, { source, chunks: 1, threadId: owner });
+  }
+
+  return [...groups.values()];
+}
+
 export interface VectorStoreDriver {
   readonly name: string;
   /** True when the backing store survives a process restart. */
@@ -66,7 +101,16 @@ export interface VectorStoreDriver {
    * are shared with conversations that still exist.
    */
   deleteByThread(threadId: string): Promise<number>;
-  listSources(threadId?: ThreadScope): Promise<Array<{ source: string; chunks: number }>>;
+  /**
+   * Documents in scope, with the conversation each belongs to.
+   *
+   * The owner is returned because the caller cannot otherwise tell an own
+   * document from an inherited one, and the two behave differently: deleting an
+   * inherited document from a fork matches nothing, so the UI has to know not
+   * to offer it. Grouped by source *and* owner, so the same filename uploaded
+   * to two conversations is two entries rather than one with a merged count.
+   */
+  listSources(threadId?: ThreadScope): Promise<DocumentSummary[]>;
   count(threadId?: ThreadScope): Promise<number>;
   healthy(): Promise<boolean>;
 }

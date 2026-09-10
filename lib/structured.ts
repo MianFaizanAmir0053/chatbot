@@ -15,6 +15,25 @@ import type { z } from "zod";
  * and reading its validated arguments. Tool calling works on every provider we
  * support, which makes this the more portable mechanism of the two.
  */
+/**
+ * Keeps an auxiliary call's output out of LangGraph's token stream.
+ *
+ * Structured extraction is never something a user should read, but it is not
+ * reliably invisible either. `withStructuredOutput` only produces a tool call on
+ * legacy GPT models; for everything else — every provider in this registry — it
+ * defaults to a `json_schema` response format, so the result arrives as ordinary
+ * message *content*. A planner or judge invoked from inside a tool runs at the
+ * root graph's own depth, which makes that content indistinguishable from the
+ * supervisor's answer by nesting alone: the query planner's raw
+ * `{"variants":[...]}` object was streamed to the user, written to the
+ * transcript, and then scored for groundedness as if it were part of the reply.
+ *
+ * LangGraph's stream handler drops any model run carrying this tag, so applying
+ * it here covers every call site — including ones added later, which is the
+ * point of putting it in the shared helper rather than at each call.
+ */
+const NOSTREAM = { tags: ["langsmith:nostream"] };
+
 export async function structuredInvoke<T extends z.ZodTypeAny>(
   model: BaseChatModel | BaseChatModel[],
   schema: T,
@@ -54,7 +73,7 @@ async function invokeOne<T extends z.ZodTypeAny>(
 ): Promise<z.infer<T>> {
   try {
     const structured = model.withStructuredOutput(schema, { name });
-    return (await structured.invoke(messages)) as z.infer<T>;
+    return (await structured.invoke(messages, NOSTREAM)) as z.infer<T>;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     // Anything else is a genuine failure (bad key, rate limit) and should surface.
@@ -87,11 +106,13 @@ async function extractViaToolCall<T extends z.ZodTypeAny>(
   // explicit instruction, models reliably call it anyway.
   let response;
   try {
-    response = await model.bindTools([extractor], { tool_choice: name }).invoke(messages);
+    response = await model
+      .bindTools([extractor], { tool_choice: name })
+      .invoke(messages, NOSTREAM);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     if (!/tool_choice/i.test(message)) throw error;
-    response = await model.bindTools([extractor]).invoke(messages);
+    response = await model.bindTools([extractor]).invoke(messages, NOSTREAM);
   }
 
   const calls =

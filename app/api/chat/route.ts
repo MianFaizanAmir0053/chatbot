@@ -2,6 +2,12 @@ import { NextRequest } from "next/server";
 import { randomUUID } from "crypto";
 import { AIMessage, HumanMessage, type BaseMessage } from "@langchain/core/messages";
 import { buildAgent, runConfig } from "@/lib/agents/agent";
+import {
+  ANSWER_NODE,
+  isAnswerChunk,
+  isNested,
+  visibleText,
+} from "@/lib/agents/stream-filter";
 import { appendMessages, getConversation, scopeChainFor } from "@/lib/conversations/store";
 import { batchQualifiesForVerification } from "@/lib/agents/subagents";
 import { hasReasoningProvider } from "@/lib/config";
@@ -32,34 +38,6 @@ const MAX_REPLAYED_TURNS = 12;
  * ------------------------------------------------------------------ */
 
 type Emit = (event: string, data: unknown) => void;
-
-/**
- * Pull the user-visible text out of a streamed chunk's content.
- *
- * `content` arrives either as a plain string or as an array of content blocks.
- * `createAgent` uses the block form, so matching on `typeof content === "string"`
- * silently discarded every token: the run completed, tools fired and the
- * groundedness judge scored an empty string as perfectly grounded, while the
- * client received no answer at all.
- *
- * Only `text` blocks are collected. Reasoning blocks are deliberately excluded —
- * they are not part of the answer and must not reach the transcript.
- */
-function visibleText(content: unknown): string {
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return "";
-
-  let out = "";
-  for (const block of content) {
-    if (typeof block === "string") {
-      out += block;
-      continue;
-    }
-    const { type, text } = (block ?? {}) as { type?: string; text?: unknown };
-    if (type === "text" && typeof text === "string") out += text;
-  }
-  return out;
-}
 
 function sseStream(run: (emit: Emit, signal: AbortSignal) => Promise<void>): Response {
   const encoder = new TextEncoder();
@@ -107,26 +85,6 @@ function sseStream(run: (emit: Emit, signal: AbortSignal) => Promise<void>): Res
       "X-Accel-Buffering": "no",
     },
   });
-}
-
-/**
- * True when a streamed chunk came from a nested graph rather than the supervisor.
- *
- * LangGraph builds a nested run's checkpoint namespace by appending to its
- * parent's, separated by `|`, so depth is a structural property of the run
- * rather than anything a model or a tool controls. The root graph's own nodes
- * are at depth zero or one; a researcher invoked inside `delegate_research` is
- * deeper.
- *
- * Erring towards treating a chunk as nested is the safe direction: the worst
- * case is that a token is not streamed live, and the answer is still delivered
- * whole from the update stream. The opposite mistake puts a researcher's raw
- * working in front of the user as if it were the answer.
- */
-function isNested(meta: Record<string, unknown> | undefined): boolean {
-  const ns = meta?.checkpoint_ns ?? meta?.langgraph_checkpoint_ns;
-  if (typeof ns !== "string" || ns.length === 0) return false;
-  return ns.split("|").filter(Boolean).length > 1;
 }
 
 function clientKey(req: NextRequest): string {
@@ -247,6 +205,16 @@ export async function POST(req: NextRequest) {
     const reportedResults = new Set<string>();
     /** The automatic verification branch is announced once per turn. */
     let verificationShown = false;
+    /**
+     * Root-graph text that was withheld because it came from a node other than
+     * the one that writes the answer.
+     *
+     * Expected to be non-zero — tools and middleware think out loud. It only
+     * means something when the answer streamed nothing at all, which is the
+     * signature of the node allowlist having gone stale rather than of a
+     * provider that does not send deltas.
+     */
+    let suppressedRootText = 0;
 
     const config = runConfig({ threadId: thread, signal, mode: thinking, deepAgents });
 
@@ -301,7 +269,6 @@ export async function POST(req: NextRequest) {
     for await (const chunk of stream) {
       const [streamMode, payload] = chunk as [string, unknown];
 
-
       if (streamMode === "messages") {
         // Token-level streaming of the model's visible output.
         const [token, meta] = payload as [
@@ -309,21 +276,24 @@ export async function POST(req: NextRequest) {
           Record<string, unknown> | undefined,
         ];
 
-        // Subagents run inside the `task` tool, and the callback manager is
-        // inherited, so their model output arrives on this same stream. Emitting
-        // it would splice every researcher's internal working into the user's
-        // answer. Nesting depth is the discriminator: LangGraph namespaces a
-        // nested run by appending to its parent's, so anything deeper than the
-        // root graph is a delegation and belongs only in the finding it returns.
-        if (isNested(meta)) continue;
-
+        // Every model call inside the run shares this stream, because the
+        // callback manager is inherited: subagents delegated to, the query
+        // planner inside a retrieval tool, the summariser, the moderation pass.
+        // None of them are the answer, and emitting them splices raw internal
+        // working into what the user is reading. Only the supervisor's own
+        // model node writes the answer, so that is what is streamed.
         const type = token?.getType?.();
         if (type === "ai") {
           const text = visibleText(token.content);
-          if (text) {
-            answer += text;
-            emit("token", { text });
+          if (!text) continue;
+          if (!isAnswerChunk(meta)) {
+            // Counted so a stale node name is visible in the logs rather than
+            // silently costing live streaming for every answer.
+            if (!isNested(meta)) suppressedRootText++;
+            continue;
           }
+          answer += text;
+          emit("token", { text });
         }
         continue;
       }
@@ -449,6 +419,16 @@ export async function POST(req: NextRequest) {
     // Nothing streamed, but the agent did produce an answer: send it as one
     // chunk rather than leaving the client with an empty assistant turn.
     if (!answer && bufferedAnswer) {
+      if (suppressedRootText > 0) {
+        // The run streamed root-graph text and none of it was the answer node's.
+        // Either `createAgent` renamed that node, or the answer arrived only in
+        // the update. Worth saying out loud: the answer below is correct, but
+        // it appeared all at once instead of typing out.
+        console.warn(
+          `[chat] no tokens passed the answer-node filter (${suppressedRootText} chunk(s) ` +
+            `withheld) — check that "${ANSWER_NODE}" is still the agent's model node`,
+        );
+      }
       answer = bufferedAnswer;
       emit("token", { text: bufferedAnswer });
     }

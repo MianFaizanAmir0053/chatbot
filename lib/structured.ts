@@ -2,6 +2,7 @@ import type { BaseChatModel } from "@langchain/core/language_models/chat_models"
 import type { BaseMessage } from "@langchain/core/messages";
 import { tool } from "@langchain/core/tools";
 import type { z } from "zod";
+import { noteModelFailure } from "./models";
 
 /**
  * Provider-agnostic structured output.
@@ -53,6 +54,12 @@ export async function structuredInvoke<T extends z.ZodTypeAny>(
       return await invokeOne(candidate, schema, messages, name, description);
     } catch (error) {
       lastError = error;
+      // Refusals that retrying cannot fix take the credential out of every
+      // rotation, not just this call. Auxiliary calls are frequent and walk the
+      // whole chain, so this is where a refused key is noticed soonest — and
+      // the pools are shared, so noticing it here also stops the agent's own
+      // model from opening on it.
+      noteModelFailure(candidate, error);
       // Try the next provider: a configured-but-dead key shouldn't disable the
       // guardrail when another provider is available.
       if (candidates.length > 1) {

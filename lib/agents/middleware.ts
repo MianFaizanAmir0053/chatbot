@@ -14,6 +14,7 @@ import {
 } from "langchain";
 import { ChatOpenAI } from "@langchain/openai";
 import { FALLBACK_MODELS, GUARDRAIL_CONFIG, SUBAGENT_CONFIG, env, features } from "../config";
+import { isPermanentRefusal } from "../credential-health";
 import { getFallbackModels, getModel } from "../models";
 
 
@@ -121,6 +122,19 @@ export function buildMiddleware(options: MiddlewareOptions = {}) {
       maxDelayMs: 30_000,
       jitter: true,
       onFailure: "continue",
+      // Do not spend the backoff on an answer that will never change.
+      //
+      // The default retries anything not explicitly stamped non-retryable, and
+      // `@langchain/openai` stamps only 401, 404 and 400s about tool calls. A
+      // 400 saying the *account* is refused — "Organization has been
+      // restricted" — is left unstamped, so it was retried four times over
+      // roughly thirty seconds before the fallback chain was reached at all.
+      // With most keys in that state, that was the dominant cost of a request.
+      //
+      // Only refusals of the credential itself are excluded here. Everything
+      // ambiguous still retries, because the backoff exists for rate limits and
+      // those are precisely the errors worth waiting out.
+      retryOn: (error: Error) => !isPermanentRefusal(error),
     }),
   );
 

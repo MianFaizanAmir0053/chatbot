@@ -86,7 +86,16 @@ async function checkChat(
     }
     return `OK   ${Date.now() - started}ms`;
   } catch (error) {
-    return `FAIL ${(error as Error).message.slice(0, 60)}`;
+    // A throw here is a transport failure — DNS, a reset, a connect timeout —
+    // and those are properties of the moment just as surely as a 429 is. The
+    // status path above already retries for that reason; not doing the same
+    // here reported six live Gemini keys as dead in one run, which is exactly
+    // the wrong conclusion to hand someone deciding which keys to replace.
+    if (attempt === 1) {
+      await new Promise((r) => setTimeout(r, 5_000));
+      return checkChat(baseURL, key, model, 2);
+    }
+    return `BUSY network ${(error as Error).message.slice(0, 50)} (transport, retried once)`;
   }
 }
 
@@ -100,9 +109,13 @@ async function main() {
     else if (status.startsWith("BUSY")) chatBusy++;
     console.log(`  ${String(i + 1).padStart(2)}. ${p.name.padEnd(12)} ${mask(p.apiKey)}  ${status}`);
   }
+  // Three states, not two. Only the last is a reason to replace a credential,
+  // and conflating it with "busy" is how a working key gets thrown away.
+  const chatDead = LLM_PROVIDERS.length - chatOk - chatBusy;
   console.log(
-    `  -> ${chatOk}/${LLM_PROVIDERS.length} usable` +
-      (chatBusy > 0 ? `, ${chatBusy} temporarily busy (not a key problem)` : "") +
+    `  -> ${chatOk}/${LLM_PROVIDERS.length} answering now` +
+      (chatBusy > 0 ? `, ${chatBusy} busy (rate limit or transport — still yours)` : "") +
+      (chatDead > 0 ? `, ${chatDead} refused (needs a new credential)` : "") +
       "\n",
   );
 

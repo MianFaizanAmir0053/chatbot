@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { activeSearchProvider } from "@/lib/agents/websearch";
 import { conversationStoreInfo } from "@/lib/conversations/store";
+import { refusedCredentials } from "@/lib/credential-health";
 import {
   COHERE_API_KEYS,
   LLM_PROVIDERS,
@@ -14,6 +15,7 @@ import {
   activeModelId,
   activeProviderName,
   primaryKeyCount,
+  primaryKeysConfigured,
   subagentKeyCount,
   subagentProviderNames,
 } from "@/lib/models";
@@ -78,6 +80,19 @@ export async function GET() {
      * Free tiers meter per key, so this multiplies the daily ceiling.
      */
     keyRotation: primaryKeyCount(),
+    /**
+     * Keys configured against the primary provider, refused ones included.
+     *
+     * Reported next to `keyRotation` so a shrinking pool is visible. The two
+     * diverging is the signal that credentials are being refused — otherwise a
+     * rotation quietly narrowing to one key looks exactly like a healthy one.
+     */
+    keysConfigured: primaryKeysConfigured(),
+    /**
+     * Credentials taken out of the rotation after a refusal that retrying
+     * cannot fix. Endpoint and reason only — never the key.
+     */
+    refusedCredentials: refusedCredentials(),
     pro: activeModelId("pro"),
     fast: activeModelId("fast"),
     configuredTiers: MODEL_TIERS,

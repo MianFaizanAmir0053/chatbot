@@ -17,7 +17,36 @@ import {
   features,
 } from "./config";
 
+import { credentialId, isRefused, noteFailure, usable } from "./credential-health";
+
 export type ModelTier = "pro" | "fast";
+
+/**
+ * Which credential built a given model.
+ *
+ * A model object does not carry its key anywhere a caller can read it, and the
+ * error it throws does not either — so without this, a refusal cannot be
+ * attributed to the credential that earned it and the rotation keeps handing
+ * that credential out. Weak so a model is still collected normally.
+ */
+const credentials = new WeakMap<BaseChatModel, string>();
+
+function stamp(model: BaseChatModel, baseURL: string, apiKey: string): BaseChatModel {
+  credentials.set(model, credentialId(baseURL, apiKey));
+  return model;
+}
+
+/**
+ * Report a failed call so a refused credential leaves the rotation.
+ *
+ * Called from wherever a chain walks candidates itself, which is the one place
+ * a failure can still be tied to the model that caused it. Errors that might
+ * succeed later are ignored — see `isPermanentRefusal`.
+ */
+export function noteModelFailure(model: BaseChatModel, error: unknown): void {
+  const id = credentials.get(model);
+  if (id) noteFailure(id, error);
+}
 
 export interface ModelOptions {
   temperature?: number;
@@ -80,12 +109,26 @@ function openAIModel(tier: ModelTier, temperature: number, maxTokens?: number): 
 let keyCursor = 0;
 let lastPrimaryKey = "";
 
-/** Every key configured against the endpoint serving the primary model. */
+/**
+ * Every key configured against the endpoint serving the primary model.
+ *
+ * Refused keys are dropped. This is the pool that matters most: it feeds the
+ * agent's own model, and a rotation that keeps dealing out refused credentials
+ * puts one at the front of most requests — where each costs a full retry
+ * sequence before any fallback is reached.
+ */
 function primaryKeyPool(): string[] {
   const pool = LLM_PROVIDERS.filter((p) => p.baseURL === env.DEEPSEEK_BASE_URL).map(
     (p) => p.apiKey,
   );
-  return pool.length > 0 ? pool : splitKeys(env.DEEPSEEK_API_KEY);
+  const configured = pool.length > 0 ? pool : splitKeys(env.DEEPSEEK_API_KEY);
+  return usable(configured, (key) => credentialId(env.DEEPSEEK_BASE_URL, key));
+}
+
+/** How many primary keys are configured, refused or not. Reported by /api/health. */
+export function primaryKeysConfigured(): number {
+  const pool = LLM_PROVIDERS.filter((p) => p.baseURL === env.DEEPSEEK_BASE_URL);
+  return pool.length > 0 ? pool.length : splitKeys(env.DEEPSEEK_API_KEY).length;
 }
 
 /**
@@ -111,13 +154,15 @@ export function getModel(tier: ModelTier = "pro", options: ModelOptions = {}): B
   const temperature = options.temperature ?? (tier === "fast" ? 0 : 0.1);
 
   if (features.deepseek) {
-    return new ChatDeepSeek({
+    const apiKey = nextPrimaryKey();
+    const model = new ChatDeepSeek({
       model: tier === "pro" ? MODEL_TIERS.PRO : MODEL_TIERS.FAST,
-      apiKey: nextPrimaryKey(),
+      apiKey,
       temperature,
       maxTokens: options.maxTokens,
       configuration: { baseURL: env.DEEPSEEK_BASE_URL },
     }) as unknown as BaseChatModel;
+    return stamp(model, env.DEEPSEEK_BASE_URL, apiKey);
   }
 
   if (features.openai) {
@@ -162,8 +207,20 @@ let subagentCursor = 0;
  * of four draws four different keys and the branches genuinely run in parallel
  * instead of queueing behind one key's rate limit.
  */
+/**
+ * The subagent pool, minus refused credentials.
+ *
+ * Matters more here than elsewhere: a fan-out draws one credential per branch,
+ * so refused entries left in the pool land on specific branches and strand
+ * them. The supervisor then reports a gap in the evidence that was really an
+ * account problem.
+ */
+function liveSubagentProviders(): LlmProvider[] {
+  return usable(SUBAGENT_PROVIDERS, (p) => credentialId(p.baseURL, p.apiKey));
+}
+
 export function getSubagentModel(tier: ModelTier = "pro", temperature = 0.1): BaseChatModel {
-  const pool = SUBAGENT_PROVIDERS;
+  const pool = liveSubagentProviders();
   if (pool.length === 0) return getModel(tier, { temperature });
 
   const provider = pool[subagentCursor++ % pool.length];
@@ -181,7 +238,7 @@ export function getSubagentModel(tier: ModelTier = "pro", temperature = 0.1): Ba
  * absence in the documents.
  */
 export function getSubagentFallbackModels(tier: ModelTier = "pro"): BaseChatModel[] {
-  const pool = SUBAGENT_PROVIDERS;
+  const pool = liveSubagentProviders();
   if (pool.length <= 1) return [];
 
   // Start after the entry the rotation just handed out, so the first fallback
@@ -214,21 +271,31 @@ export function subagentKeyCount(): number {
 export function getAuxModels(tier: ModelTier = "fast", temperature = 0): BaseChatModel[] {
   const chain: BaseChatModel[] = [];
 
-  if (features.deepseek) {
+  const primaryId = credentialId(env.DEEPSEEK_BASE_URL, env.DEEPSEEK_API_KEY ?? "");
+  if (features.deepseek && !isRefused(primaryId)) {
     chain.push(
-      new ChatDeepSeek({
-        model: tier === "pro" ? MODEL_TIERS.PRO : MODEL_TIERS.FAST,
-        apiKey: env.DEEPSEEK_API_KEY,
-        temperature,
-        configuration: { baseURL: env.DEEPSEEK_BASE_URL },
-      }) as unknown as BaseChatModel,
+      stamp(
+        new ChatDeepSeek({
+          model: tier === "pro" ? MODEL_TIERS.PRO : MODEL_TIERS.FAST,
+          apiKey: env.DEEPSEEK_API_KEY,
+          temperature,
+          configuration: { baseURL: env.DEEPSEEK_BASE_URL },
+        }) as unknown as BaseChatModel,
+        env.DEEPSEEK_BASE_URL,
+        env.DEEPSEEK_API_KEY ?? "",
+      ),
     );
   }
   // Every remaining gateway, so a rate-limited primary does not silently
-  // disable the guardrail or planner that sits behind it.
-  const primary = `${env.DEEPSEEK_BASE_URL}|${env.DEEPSEEK_API_KEY ?? ""}`;
-  for (const p of LLM_PROVIDERS) {
-    if (`${p.baseURL}|${p.apiKey}` === primary) continue;
+  // disable the guardrail or planner that sits behind it. Refused credentials
+  // are dropped: this chain is walked in order on every auxiliary call, so each
+  // dead entry ahead of a live one is a failed round trip paid every time.
+  const primary = credentialId(env.DEEPSEEK_BASE_URL, env.DEEPSEEK_API_KEY ?? "");
+  const gateways = usable(
+    LLM_PROVIDERS.filter((p) => credentialId(p.baseURL, p.apiKey) !== primary),
+    (p) => credentialId(p.baseURL, p.apiKey),
+  );
+  for (const p of gateways) {
     chain.push(providerModel(p, tier, temperature));
   }
 
@@ -249,7 +316,7 @@ export function providerModel(
   tier: ModelTier,
   temperature: number,
 ): BaseChatModel {
-  return new ChatOpenAI({
+  const model = new ChatOpenAI({
     model: tier === "pro" ? provider.pro : provider.fast,
     apiKey: provider.apiKey,
     temperature,
@@ -258,6 +325,7 @@ export function providerModel(
       ...(provider.headers ? { defaultHeaders: provider.headers } : {}),
     },
   }) as unknown as BaseChatModel;
+  return stamp(model, provider.baseURL, provider.apiKey);
 }
 
 /**
@@ -278,11 +346,16 @@ export function getFallbackModels(tier: ModelTier = "pro"): BaseChatModel[] {
   // Exclude the key the rotation just handed out, not a fixed one. With keys
   // rotating, a hardcoded exclusion would drop a healthy key from the chain
   // while leaving in the very one that is about to fail.
-  const inUse = `${env.DEEPSEEK_BASE_URL}|${lastPrimaryKey || (env.DEEPSEEK_API_KEY ?? "")}`;
+  const inUse = credentialId(env.DEEPSEEK_BASE_URL, lastPrimaryKey || (env.DEEPSEEK_API_KEY ?? ""));
 
-  return LLM_PROVIDERS.filter((p) => `${p.baseURL}|${p.apiKey}` !== inUse).map((p) =>
-    providerModel(p, tier, 0),
-  );
+  // Refused credentials are dropped for the same reason they are dropped from
+  // the rotation: this chain is walked in order after a failure, so a dead entry
+  // ahead of a live one costs the request a full retry sequence before the
+  // fallback that could have answered is ever reached.
+  return usable(
+    LLM_PROVIDERS.filter((p) => credentialId(p.baseURL, p.apiKey) !== inUse),
+    (p) => credentialId(p.baseURL, p.apiKey),
+  ).map((p) => providerModel(p, tier, 0));
 }
 
 /**

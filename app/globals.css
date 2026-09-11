@@ -417,16 +417,131 @@ h3,
   font-style: italic;
 }
 
-.prose-content h3 {
+.prose-content h1,
+.prose-content h2,
+.prose-content h3,
+.prose-content h4,
+.prose-content h5,
+.prose-content h6 {
   font-family: var(--font-display-family), "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
-  font-size: 0.9375rem;
   font-weight: 600;
   margin: 1.25rem 0 0.5rem;
+  line-height: 1.35;
   color: var(--foreground);
+}
+
+/* Held close to body size deliberately. These are headings inside a chat
+   message, not on a page, and a full type scale makes one answer shout over
+   the rest of the conversation. */
+.prose-content h1 {
+  font-size: 1.125rem;
+}
+.prose-content h2 {
+  font-size: 1.0625rem;
+}
+.prose-content h3 {
+  font-size: 0.9375rem;
+}
+.prose-content h4,
+.prose-content h5,
+.prose-content h6 {
+  font-size: 0.9375rem;
+  color: var(--muted-foreground);
+}
+
+.prose-content p {
+  margin: 0.625rem 0;
+}
+
+.prose-content ul,
+.prose-content ol {
+  margin: 0.625rem 0;
+  padding-left: 1.5rem;
+}
+
+.prose-content ul {
+  list-style: disc;
+}
+
+.prose-content ol {
+  list-style: decimal;
+}
+
+/* A nested list reads as a sub-point, so it sits tight against its parent
+   rather than opening the same vertical gap as a new list would. */
+.prose-content li > ul,
+.prose-content li > ol {
+  margin: 0.25rem 0;
 }
 
 .prose-content li {
   margin: 0.25rem 0;
+}
+
+.prose-content li::marker {
+  color: var(--muted-foreground);
+}
+
+/* GFM task lists: the checkbox replaces the marker. */
+.prose-content li:has(> input[type="checkbox"]) {
+  list-style: none;
+  margin-left: -1.25rem;
+}
+
+.prose-content li > input[type="checkbox"] {
+  margin-right: 0.5rem;
+  accent-color: var(--accent-color);
+}
+
+.prose-content blockquote {
+  margin: 0.875rem 0;
+  padding: 0.125rem 0 0.125rem 0.875rem;
+  border-left: 2px solid var(--border);
+  color: var(--muted-foreground);
+}
+
+.prose-content hr {
+  margin: 1.25rem 0;
+  border: 0;
+  border-top: 1px solid var(--border);
+}
+
+/* Tables can be far wider than the conversation column, so they scroll in
+   their own box instead of stretching it. */
+.prose-table-wrap {
+  margin: 0.875rem 0;
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.prose-content table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.875rem;
+}
+
+.prose-content th,
+.prose-content td {
+  padding: 0.5rem 0.75rem;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+
+.prose-content thead th {
+  background: var(--secondary);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.prose-content tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.prose-content del {
+  text-decoration: line-through;
+  color: var(--muted-foreground);
 }
 
 .prose-content pre {

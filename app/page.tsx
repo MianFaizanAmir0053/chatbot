@@ -1,9 +1,10 @@
 "use client";
 
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { useConversations } from "./components/conversations-context";
 import { DocumentsDialog, DocumentsTrigger } from "./components/documents-dialog";
 import { ACCEPTED_UPLOADS, useKnowledge } from "./components/knowledge-context";
+import { Markdown } from "./components/markdown";
 import { ThemeToggle } from "./components/theme-toggle";
 import { Button, Pill, type Tone } from "./components/ui";
 import {
@@ -114,27 +115,6 @@ const SUGGESTIONS = [
     hint: "Corpus · web search",
   },
 ];
-
-function SimpleMarkdown({ content }: { content: string }) {
-  const rendered = useMemo(() => {
-    let html = content.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-
-    html = html.replace(/```(\w*)\n?([\s\S]*?)```/g, (_, _lang, code) => {
-      return `<pre><code>${String(code).trim()}</code></pre>`;
-    });
-    html = html.replace(/`([^`]+)`/g, "<code>$1</code>");
-    // Citation markers get a visual anchor so provenance is scannable.
-    html = html.replace(/\[(\d+)\]/g, '<sup class="citation-ref">$1</sup>');
-    html = html.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
-    html = html.replace(/\*([^*]+)\*/g, "<em>$1</em>");
-    html = html.replace(/^### (.*)$/gm, "<h3>$1</h3>");
-    html = html.replace(/^[-*] (.*)$/gm, '<li class="ml-4 list-disc">$1</li>');
-    html = html.replace(/\n/g, "<br />");
-    return html;
-  }, [content]);
-
-  return <div className="prose-content" dangerouslySetInnerHTML={{ __html: rendered }} />;
-}
 
 function TypingIndicator({ label }: { label?: string }) {
   return (
@@ -1085,7 +1065,7 @@ export default function ChatPage() {
                       {m.trace && m.trace.length > 0 && <TracePanel trace={m.trace} />}
 
                       {m.content ? (
-                        <SimpleMarkdown content={m.content} />
+                        <Markdown content={m.content} />
                       ) : (
                         loading && i === messages.length - 1 && <TypingIndicator label={status} />
                       )}

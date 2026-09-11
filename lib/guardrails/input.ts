@@ -111,17 +111,34 @@ async function classifyInjection(text: string): Promise<{ malicious: boolean; ra
  * Combined input gate
  * ------------------------------------------------------------------ */
 
+/**
+ * What a chat turn may send.
+ *
+ * Note what is *not* here: a `history` array. The client used to replay the
+ * whole conversation on every turn, which was both unnecessary and actively
+ * harmful.
+ *
+ * Unnecessary, because the server already holds the conversation twice over —
+ * in the graph's checkpointer within a process, and in the conversation store
+ * across restarts, from which the route replays the recent turns when a
+ * checkpoint is missing. The transcript the client holds is a *view* of that
+ * state, not the source of it, and it was read by nothing here.
+ *
+ * Harmful, because validating it made a long answer fatal. Each entry was
+ * capped at MAX_INPUT_CHARS, a limit meant for what a user types; the first
+ * time the agent wrote a reply longer than that, the transcript containing it
+ * failed validation on every subsequent turn and the conversation could never
+ * be continued. An unrecoverable thread, caused by the assistant answering
+ * thoroughly.
+ *
+ * Unknown keys are stripped rather than rejected, so a client still running the
+ * old build simply has its history ignored instead of being refused.
+ */
 export const ChatRequestSchema = z.object({
+  // Strict, unlike the transcript: this is the text the user actually typed,
+  // and the ceiling is a real guard against prompt-stuffing rather than
+  // incidental bookkeeping.
   message: z.string().min(1, "Message cannot be empty").max(GUARDRAIL_CONFIG.MAX_INPUT_CHARS),
-  history: z
-    .array(
-      z.object({
-        role: z.enum(["user", "assistant"]),
-        content: z.string().max(GUARDRAIL_CONFIG.MAX_INPUT_CHARS),
-      }),
-    )
-    .max(50)
-    .default([]),
   files: z
     .array(z.object({ name: z.string(), key: z.string(), type: z.string() }))
     .max(10)

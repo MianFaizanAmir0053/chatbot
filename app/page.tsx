@@ -764,10 +764,6 @@ export default function ChatPage() {
     const text = (override ?? input).trim();
     if (!text || loading) return;
 
-    const history = messages
-      .filter((m) => !m.blocked)
-      .map((m) => ({ role: m.role, content: m.content }));
-
     setMessages((prev) => [...prev, { role: "user", content: text }]);
     setInput("");
     setLoading(true);
@@ -793,9 +789,12 @@ export default function ChatPage() {
         headers: { "Content-Type": "application/json" },
         // Omit threadId entirely on the first message rather than sending null:
         // "absent" is what the server means by a new conversation.
+        // The transcript is deliberately not sent. The server holds the
+        // conversation itself — in the agent's checkpointer, and in the
+        // conversation store for when that is gone — so replaying it from here
+        // uploaded the whole chat on every turn to be validated and discarded.
         body: JSON.stringify({
           message: text,
-          history,
           ...(threadId ? { threadId } : {}),
           mode: "agentic",
           webSearch,

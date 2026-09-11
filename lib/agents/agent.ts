@@ -330,26 +330,36 @@ export function buildAgent(options: AgentOptions = {}): AgentRun {
   // told to spend the team harder instead of to search harder itself.
   const systemPrompt = composeSystemPrompt({ mode, deepAgents });
 
-  const agent = createAgent({
-    model: getModel("pro"),
-    tools: [
-      ...buildTools(collector, {
-        webSearch,
-        mode,
-        resultCache,
-        label: "supervisor",
-        delegating: deepAgents,
-        threadId,
-      }),
+  const tools = [
+    ...buildTools(collector, {
+      webSearch,
+      mode,
+      resultCache,
+      label: "supervisor",
+      delegating: deepAgents,
+      threadId,
+    }),
       // Added as an ordinary tool rather than through Deep Agents' subagent
       // middleware, because that middleware's `task` tool delegates one
       // sub-question per call and depends on the model batching several calls
       // into one message to fan out — which the providers here do not do. See
       // buildDelegationTool for the measurement.
-      ...(deepAgents ? [buildDelegationTool(collector, { webSearch, resultCache, threadId })] : []),
-    ],
+    ...(deepAgents ? [buildDelegationTool(collector, { webSearch, resultCache, threadId })] : []),
+  ];
+
+  const agent = createAgent({
+    model: getModel("pro"),
+    tools,
     systemPrompt,
-    middleware: buildMiddleware({ enableTodos: options.enableTodos, deepAgents }),
+    middleware: buildMiddleware({
+      enableTodos: options.enableTodos,
+      deepAgents,
+      // Passed so a mangled tool name can be matched back to a real tool. The
+      // middleware cannot ask the agent what tools it has, and guessing from a
+      // hardcoded list would silently stop repairing whichever tool was added
+      // last.
+      toolNames: tools.map((t) => t.name),
+    }),
     checkpointer: getCheckpointer(),
     name: "agentic_rag_supervisor",
   });

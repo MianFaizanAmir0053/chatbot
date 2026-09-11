@@ -12,6 +12,7 @@ import {
   toolCallLimitMiddleware,
   toolRetryMiddleware,
 } from "langchain";
+import { AIMessage } from "@langchain/core/messages";
 import { ChatOpenAI } from "@langchain/openai";
 import { FALLBACK_MODELS, GUARDRAIL_CONFIG, SUBAGENT_CONFIG, env, features } from "../config";
 import { isPermanentRefusal } from "../credential-health";
@@ -41,10 +42,17 @@ export interface MiddlewareOptions {
    * researchers' own tools, because it needs the run's evidence collector.
    */
   deepAgents?: boolean;
+  /**
+   * Names of the tools this agent was built with.
+   *
+   * Supplied by the caller because middleware cannot read the agent's tool
+   * list, and only exact names make repairing a mangled one safe.
+   */
+  toolNames?: string[];
 }
 
 export function buildMiddleware(options: MiddlewareOptions = {}) {
-  const { enableTodos = true, deepAgents: delegating = false } = options;
+  const { enableTodos = true, deepAgents: delegating = false, toolNames = [] } = options;
   const middleware = [];
 
   /* --- Budget ceilings: hard stops on runaway loops (cheapest guard first) --- */
@@ -227,6 +235,14 @@ export function buildMiddleware(options: MiddlewareOptions = {}) {
     );
   }
 
+  /* --- Repair: recover calls a model wrapped in its own template --- */
+
+  // Before telemetry, so the log records the tool that will actually run rather
+  // than the mangled name the model wrote.
+  if (toolNames.length > 0) {
+    middleware.push(toolCallRepairMiddleware(toolNames));
+  }
+
   /* --- Telemetry: structured visibility into what the agent actually did --- */
 
   middleware.push(agentTelemetryMiddleware());
@@ -307,6 +323,93 @@ function resilient<T>(middleware: T, label: string): T {
  * production without attaching a tracer — LangSmith gives the deep view, this
  * gives the always-on one.
  */
+/**
+ * Recover a tool call whose name arrived wrapped in the model's own template.
+ *
+ * Some models emit calls in a template their gateway only half-translates, and
+ * what reaches the agent is a real call with valid arguments under a name like
+ * `uncensored_tool_call>list_documents`. No such tool exists, so the call fails,
+ * the model is told so, and the turn spends another round trip re-asking for
+ * something it already asked for correctly.
+ *
+ * The arguments are intact and the intended tool is named right there, so the
+ * call is repairable. Matching requires the real name to sit at a boundary in
+ * the mangled one — a separator or the end — rather than merely appearing
+ * somewhere inside it, because a loose match between tools with overlapping
+ * names would route a call to the wrong one, which is far worse than failing it.
+ * Ambiguous names are left alone for the same reason.
+ */
+/** A tool name is matched literally, so any regex metacharacter in it is inert. */
+function escapeRegExp(literal: string): string {
+  return literal.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * The real tool a mangled name refers to, or null when it cannot be known.
+ *
+ * The real name must sit at a boundary of the mangled one and run to its end —
+ * `uncensored_tool_call>list_documents` resolves, `list_documents_v2` does not.
+ * Merely appearing somewhere inside is not enough: a loose match between tools
+ * with overlapping names would route a call to the wrong tool, which is far
+ * worse than failing it, since the model is told about a failure and can
+ * correct itself but is told nothing when the wrong tool answers.
+ *
+ * Ambiguity returns null for the same reason. Exported for the test that pins
+ * these boundaries down.
+ */
+export function repairToolName(mangled: string, known: string[]): string | null {
+  if (known.includes(mangled)) return null;
+  // Longest first, so `search_documents` wins over `search` when a name ends
+  // with both.
+  const matches = [...known]
+    .sort((a, b) => b.length - a.length)
+    .filter((name) => new RegExp(`(?:^|[^A-Za-z0-9_])${escapeRegExp(name)}$`).test(mangled));
+  return matches.length === 1 ? matches[0] : null;
+}
+
+export function toolCallRepairMiddleware(toolNames: string[]) {
+  const known = toolNames;
+
+  return createMiddleware({
+    name: "ToolCallRepair",
+    afterModel: (state) => {
+      const last = state.messages?.at(-1);
+      if (!AIMessage.isInstance(last) || !last.id) return undefined;
+      const calls = last.tool_calls;
+      if (!calls?.length) return undefined;
+
+      let repaired = false;
+      const fixed = calls.map((call) => {
+        const real = repairToolName(call.name, known);
+        if (!real) return call;
+        console.warn(`[agent] repaired mangled tool name: ${call.name} -> ${real}`);
+        repaired = true;
+        return { ...call, name: real };
+      });
+
+      if (!repaired) return undefined;
+
+      // A new message carrying the same id, so the reducer replaces the model's
+      // turn rather than appending a second copy of it. Cloned rather than
+      // mutated because the original may already have been checkpointed.
+      return {
+        messages: [
+          new AIMessage({
+            id: last.id,
+            content: last.content,
+            tool_calls: fixed,
+            invalid_tool_calls: last.invalid_tool_calls,
+            additional_kwargs: last.additional_kwargs,
+            response_metadata: last.response_metadata,
+            usage_metadata: last.usage_metadata,
+            name: last.name,
+          }),
+        ],
+      };
+    },
+  });
+}
+
 function agentTelemetryMiddleware() {
   return createMiddleware({
     name: "AgentTelemetry",

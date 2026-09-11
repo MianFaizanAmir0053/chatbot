@@ -10,9 +10,11 @@ import { HumanMessage } from "@langchain/core/messages";
 import { setMaxListeners } from "events";
 import { z } from "zod";
 import { SUBAGENT_CONFIG } from "../config";
+import { isPermanentRefusal } from "../credential-health";
 import { normaliseCitations } from "../guardrails/output";
 import { getSubagentFallbackModels, getSubagentModel } from "../models";
 import type { ThreadScope } from "../vectorstore";
+import { toolCallRepairMiddleware } from "./middleware";
 import { buildTools, type EvidenceCollector } from "./tools";
 
 /**
@@ -152,7 +154,7 @@ ${FINDING_CONTRACT}`;
  * meets a rate limit fails in lockstep, every branch retrying at the same
  * instant against the same limiter.
  */
-function subagentMiddleware(): AnyAgentMiddleware[] {
+function subagentMiddleware(toolNames: string[] = []): AnyAgentMiddleware[] {
   // Annotated rather than inferred: each middleware factory returns its own
   // state-shape generic, so an inferred array literal narrows to the first
   // entry's type and rejects every later push.
@@ -166,9 +168,17 @@ function subagentMiddleware(): AnyAgentMiddleware[] {
       maxDelayMs: 20_000,
       jitter: true,
       onFailure: "continue",
+      // As on the supervisor: a refused credential cannot be retried into
+      // working, and a branch that spends its backoff discovering that is a
+      // branch the whole fan-out waits on for nothing.
+      retryOn: (error: Error) => !isPermanentRefusal(error),
     }),
     toolRetryMiddleware({ maxRetries: 2, backoffFactor: 2, onFailure: "continue" }),
   ];
+
+  // Researchers draw from the gateways most likely to mangle a tool call, since
+  // the pool is rotated per branch precisely to spread across providers.
+  if (toolNames.length > 0) middleware.push(toolCallRepairMiddleware(toolNames));
 
   const fallbacks = getSubagentFallbackModels("pro");
   if (fallbacks.length > 0) middleware.push(modelFallbackMiddleware(...fallbacks));
@@ -258,35 +268,34 @@ function compileResearchers(collector: EvidenceCollector, options: SubagentOptio
   // so building the spec once would bake one key into every instance and
   // reintroduce exactly the contention the pool exists to remove.
   const specFor = (name: ResearcherName): SubAgent => {
-    const base: Record<ResearcherName, Omit<SubAgent, "model">> = {
-    "document-researcher": {
-      name: "document-researcher",
-      description: "Investigates one sub-question against the uploaded documents.",
-      systemPrompt: DOCUMENT_RESEARCHER_PROMPT,
-      mode: "isolated",
-      tools: researchTools("document-researcher", false),
-      middleware: subagentMiddleware(),
-    },
-    verifier: {
-      name: "verifier",
-      description: "Adversarially checks one claim for exceptions and contradictions.",
-      systemPrompt: VERIFIER_PROMPT,
-      mode: "isolated",
-      tools: researchTools("verifier", false),
-      middleware: subagentMiddleware(),
-    },
-    "web-researcher": {
-      name: "web-researcher",
-      description: "Investigates one sub-question against public web sources.",
-      systemPrompt: WEB_RESEARCHER_PROMPT,
-      mode: "isolated",
-      // Falls back to the document tools when the web is disabled, so a
-      // misaddressed delegation still does useful work rather than failing.
-      tools: researchTools("web-researcher", webSearch),
-      middleware: subagentMiddleware(),
-    },
+    // Built for the requested specialist only. The web researcher is the one
+    // that gets web access; when it is switched off it falls back to the
+    // document tools, so a misaddressed delegation still does useful work
+    // rather than failing.
+    const tools = researchTools(name, name === "web-researcher" ? webSearch : false);
+    const middleware = subagentMiddleware(tools.map((t) => t.name));
+
+    const base: Record<ResearcherName, Omit<SubAgent, "model" | "tools" | "middleware">> = {
+      "document-researcher": {
+        name: "document-researcher",
+        description: "Investigates one sub-question against the uploaded documents.",
+        systemPrompt: DOCUMENT_RESEARCHER_PROMPT,
+        mode: "isolated",
+      },
+      verifier: {
+        name: "verifier",
+        description: "Adversarially checks one claim for exceptions and contradictions.",
+        systemPrompt: VERIFIER_PROMPT,
+        mode: "isolated",
+      },
+      "web-researcher": {
+        name: "web-researcher",
+        description: "Investigates one sub-question against public web sources.",
+        systemPrompt: WEB_RESEARCHER_PROMPT,
+        mode: "isolated",
+      },
     };
-    return { ...base[name], model: getSubagentModel("pro") };
+    return { ...base[name], tools, middleware, model: getSubagentModel("pro") };
   };
 
   // One compiled agent per (specialist, slot). Compiled lazily, because most

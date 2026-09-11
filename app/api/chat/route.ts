@@ -14,8 +14,10 @@ import { hasReasoningProvider } from "@/lib/config";
 import { ChatRequestSchema, guardInput } from "@/lib/guardrails/input";
 import {
   checkGroundedness,
+  hasToolCallMarkup,
   normaliseCitations,
   stripInvalidCitations,
+  stripToolCallMarkup,
   validateCitations,
 } from "@/lib/guardrails/output";
 import { ingestFiles } from "@/lib/ingest/pipeline";
@@ -206,6 +208,14 @@ export async function POST(req: NextRequest) {
     /** The automatic verification branch is announced once per turn. */
     let verificationShown = false;
     /**
+     * The model wrote a tool call as text rather than calling the tool.
+     *
+     * Tracked for the whole turn because the consequence outlives the chunk it
+     * was spotted in: the call never ran, so whatever the model wrote alongside
+     * it was written without the evidence it was reaching for.
+     */
+    let unexecutedToolCall = false;
+    /**
      * Root-graph text that was withheld because it came from a node other than
      * the one that writes the answer.
      *
@@ -294,6 +304,25 @@ export async function POST(req: NextRequest) {
           }
           answer += text;
           emit("token", { text });
+
+          // A tool call the model wrote as text instead of calling.
+          //
+          // Retracted for the same reason a preamble is: it is not the answer.
+          // The difference is what it implies — the call never ran, so anything
+          // the model wrote around it was composed without the result it was
+          // asking for. That is recorded, so a turn that never got its evidence
+          // is not later presented as a researched answer.
+          //
+          // Tested against the accumulated answer rather than the chunk: the
+          // opening tag arrives split across several tokens, so by the time the
+          // shape is recognisable some of it has already been streamed. Hence a
+          // retraction rather than a filter.
+          if (!unexecutedToolCall && hasToolCallMarkup(answer)) {
+            unexecutedToolCall = true;
+            console.warn("[chat] model emitted a tool call as text; it was never executed");
+            answer = stripToolCallMarkup(answer);
+            emit("revised_answer", { text: answer });
+          }
         }
         continue;
       }
@@ -410,7 +439,18 @@ export async function POST(req: NextRequest) {
             }
           } else if (type === "ai") {
             const text = visibleText(last?.content);
-            if (text) bufferedAnswer = text;
+            // Sanitised here too, not only on the token path: a provider that
+            // returns the completion whole never streams a chunk, so the update
+            // is the only place its unexecuted call would be seen.
+            if (text && hasToolCallMarkup(text)) {
+              if (!unexecutedToolCall) {
+                unexecutedToolCall = true;
+                console.warn("[chat] model emitted a tool call as text; it was never executed");
+              }
+              bufferedAnswer = stripToolCallMarkup(text);
+            } else if (text) {
+              bufferedAnswer = text;
+            }
           }
         }
       }
@@ -452,7 +492,18 @@ export async function POST(req: NextRequest) {
       const researched = collector.documents.length > 0 || collector.searches.length > 0;
 
       emit("error", {
-        message: researched
+        // A third cause, and the only one where the run was never given the
+        // chance to answer: the model wrote its tool call in a template the
+        // gateway does not parse, so the call was never made and generation
+        // stopped waiting for a result that could not arrive. Reporting this as
+        // a budget overrun or a rate limit would send the user to check the
+        // wrong thing entirely — the fix is a different provider, not a
+        // narrower question or a topped-up balance.
+        message: unexecutedToolCall
+          ? "The model tried to search but wrote the request in a format this provider " +
+            "does not execute, so nothing was retrieved and it stopped waiting for a result. " +
+            "This is a quirk of one provider — asking again will usually land on another one."
+          : researched
           ? "The research completed but no answer was written — the turn ran out of budget " +
             `before synthesising. It gathered ${collector.documents.length} passage(s) across ` +
             `${collector.searches.length} search(es). Asking a narrower question usually gets ` +

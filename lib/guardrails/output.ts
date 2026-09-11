@@ -129,6 +129,63 @@ export async function checkGroundedness(
 }
 
 /**
+ * Tool-call markup that arrived as prose instead of as a tool call.
+ *
+ * Not every model emits calls in the wire format its gateway parses. Several
+ * families have their own template — `<tool_call>`, `<|python_tag|>`,
+ * `<function=name>`, a ```tool_code fence — and a fine-tune renames it again;
+ * one observed here writes `<uncensored_tool_call>search_documents<arg_key>
+ * query</arg_key><arg_value>…</arg_value>`. When the gateway does not translate
+ * its template, the text lands in `content` and the call never happens.
+ *
+ * Matched on the shape rather than on any one vendor's tag, because the set of
+ * tags is open-ended and a miss here is silent: the markup is streamed to the
+ * user as the answer.
+ */
+const TOOL_CALL_MARKUP =
+  /<\|?\/?[a-z_]*tool[_-]?call\|?>|<\/?arg_(?:key|value)>|<\|python_tag\|>|<\/?function(?:_call)?[=>\s]|```tool_(?:code|call)/i;
+
+/**
+ * True when the model wrote a tool call out as text.
+ *
+ * Worth a check of its own because of what it implies. This is not cosmetic
+ * damage to an answer — it means the model tried to call a tool, the call was
+ * never executed, and whatever else it wrote was composed without the result it
+ * was asking for. Treating the remaining prose as an answer would present an
+ * ungrounded guess as a researched one.
+ */
+export function hasToolCallMarkup(text: string): boolean {
+  return TOOL_CALL_MARKUP.test(text);
+}
+
+/**
+ * Remove an unexecuted tool call from answer text.
+ *
+ * Removal rather than repair: there is nothing to recover. The call cannot be
+ * run after the fact, and the arguments are only a record of what the model
+ * wanted to look up. Callers must decide separately whether what survives is
+ * still an answer — see the route, which falls through to the no-answer path
+ * when it is not.
+ */
+export function stripToolCallMarkup(text: string): string {
+  return (
+    text
+      // A complete template, opening tag through closing tag.
+      .replace(/<\|?([a-z_]*tool[_-]?call)\|?>[\s\S]*?<\/\|?\1\|?>/gi, "")
+      // An unterminated one, which is the usual case when generation stops
+      // while the model waits for a result that will never arrive.
+      .replace(/<\|?[a-z_]*tool[_-]?call\|?>[\s\S]*$/i, "")
+      .replace(/<\|python_tag\|>[\s\S]*$/i, "")
+      .replace(/```tool_(?:code|call)[\s\S]*?(?:```|$)/gi, "")
+      // Leftover argument wrappers from a partially-matched template.
+      .replace(/<\/?arg_(?:key|value)>/gi, " ")
+      .replace(/<\/?function(?:_call)?[^>]*>/gi, "")
+      .replace(/[ \t]{2,}/g, " ")
+      .trim()
+  );
+}
+
+/**
  * Repair citation markers the model wrote in a near-miss format.
  *
  * Validation only recognises `[n]`, and anything else slips through every check

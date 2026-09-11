@@ -78,6 +78,50 @@ function scopeDocs(docs: Document[], threadId?: ThreadScope): Document[] {
 }
 
 /** Stable identity for a chunk, used to align the same document across rankers. */
+/**
+ * Failures that are the network's, not the query's.
+ *
+ * A connect timeout, a reset, a DNS hiccup, a gateway error — none of these say
+ * anything about whether the search would succeed a moment later. A rejected
+ * filter or a missing collection does, and retrying that only doubles the wait
+ * before the same failure.
+ */
+function isTransientSearchFailure(error: unknown): boolean {
+  const e = error as { code?: string; message?: string; status?: number; cause?: unknown };
+  const code = String(e?.code ?? (e?.cause as { code?: string })?.code ?? "");
+  if (/TIMEOUT|ECONNRESET|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|UND_ERR/i.test(code)) return true;
+  if (typeof e?.status === "number" && e.status >= 500) return true;
+  return /fetch failed|timeout|socket hang up|network/i.test(String(e?.message ?? ""));
+}
+
+/**
+ * One dense search, retried once when the failure was the network's.
+ *
+ * Worth the extra attempt because of how quietly the alternative fails. The
+ * catch below returns an empty result, so a single dropped connection removes
+ * dense retrieval from the fusion entirely and the answer is built from BM25
+ * alone — with no error, no warning, and an answer that still looks
+ * well-formed. That was observed here as a 10s connect timeout to Qdrant while
+ * the cluster was reachable before and after.
+ *
+ * Only once, and only for transient failures: the caller is a user waiting on a
+ * search, and a second attempt at something that cannot work just adds the
+ * whole timeout again.
+ */
+async function denseSearch(
+  store: Awaited<ReturnType<typeof getVectorStore>>,
+  query: string,
+  threadId?: ThreadScope,
+): Promise<[Document, number][]> {
+  try {
+    return await store.similaritySearchWithScore(query, RETRIEVAL_CONFIG.DENSE_TOP_K, threadId);
+  } catch (error) {
+    if (!isTransientSearchFailure(error)) throw error;
+    console.warn("[hybrid] dense search hit a transient failure, retrying once");
+    return store.similaritySearchWithScore(query, RETRIEVAL_CONFIG.DENSE_TOP_K, threadId);
+  }
+}
+
 function docKey(doc: Document): string {
   const src = String(doc.metadata?.source ?? "");
   const idx = doc.metadata?.chunkIndex;
@@ -144,14 +188,17 @@ export async function hybridSearch(
     Promise.all(
       queries.map(async (q, i) => {
         try {
-          const hits = await store.similaritySearchWithScore(
-            q,
-            RETRIEVAL_CONFIG.DENSE_TOP_K,
-            threadId,
-          );
+          const hits = await denseSearch(store, q, threadId);
           return { name: `dense:${i}`, docs: hits.map(([doc]) => doc) };
         } catch (error) {
-          console.error("[hybrid] dense search failed:", error);
+          // Degrading to BM25 alone keeps the search alive, but it is a real
+          // loss of quality — dense retrieval is what survives a vocabulary
+          // mismatch between the question and the document — and nothing
+          // downstream can tell it happened. Said plainly for that reason.
+          console.error(
+            `[hybrid] dense search failed twice; answering from BM25 alone for this query:`,
+            error,
+          );
           return { name: `dense:${i}`, docs: [] as Document[] };
         }
       }),

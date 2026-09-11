@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { activeSearchProvider } from "@/lib/agents/websearch";
 import { conversationStoreInfo } from "@/lib/conversations/store";
-import { refusedCredentials } from "@/lib/credential-health";
+import { credentialId, isRefused, refusedCredentials } from "@/lib/credential-health";
 import {
   COHERE_API_KEYS,
   LLM_PROVIDERS,
@@ -70,8 +70,15 @@ export async function GET() {
      * per-key rate limits that gateway can absorb before the chain moves on.
      */
     chain: [...new Set(LLM_PROVIDERS.map((p) => p.name))].map((name) => {
-      const keys = LLM_PROVIDERS.filter((p) => p.name === name).length;
-      return keys > 1 ? `${name} (${keys} keys)` : name;
+      const entries = LLM_PROVIDERS.filter((p) => p.name === name);
+      // Live count against configured, because they diverge silently. A gateway
+      // reported as "8 keys" while seven of them are refused describes failover
+      // depth this deployment does not have.
+      const live = entries.filter((p) => !isRefused(credentialId(p.baseURL, p.apiKey))).length;
+      if (entries.length === 1) return live === 1 ? name : `${name} (refused)`;
+      return live === entries.length
+        ? `${name} (${entries.length} keys)`
+        : `${name} (${live} of ${entries.length} keys live)`;
     }),
     /** Total entries actually tried, which is what bounds failover depth. */
     chainDepth: LLM_PROVIDERS.length,

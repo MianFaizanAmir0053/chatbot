@@ -64,8 +64,26 @@ function classification() {
   );
 
   // The other half: everything the pool exists to survive.
-  check("a rate limit is not", !isPermanentRefusal(apiError(429, "Rate limit reached")), "429");
-  check("nor a quota message", !isPermanentRefusal(apiError(429, "You exceeded your quota")));
+  // A daily ceiling cannot clear inside a request, so retrying it only spends
+  // the branch's budget on a limit with hours left to run.
+  check(
+    "a daily limit is treated as unrecoverable for now",
+    isPermanentRefusal(apiError(429, "Daily token limit exceeded. Troubleshooting URL: ...")),
+    "observed in a trace",
+  );
+  check(
+    "and a per-day request cap likewise",
+    isPermanentRefusal(apiError(429, "Rate limit: 200 requests per day exceeded")),
+  );
+
+  check("a plain rate limit is not", !isPermanentRefusal(apiError(429, "Rate limit reached")), "429");
+  // Deliberately not matched: several gateways send this for a per-minute
+  // window that clears in seconds, and the backoff is there to wait it out.
+  check(
+    "nor an unqualified quota message",
+    !isPermanentRefusal(apiError(429, "You exceeded your current quota, please check your plan")),
+    "window unstated — assume short",
+  );
   check("nor an outage", !isPermanentRefusal(apiError(503, "Service Unavailable")));
   check("nor a gateway error", !isPermanentRefusal(apiError(502, "Bad Gateway")));
   check(

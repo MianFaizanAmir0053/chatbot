@@ -1,4 +1,5 @@
 import { env } from "../config";
+import { stripLeakedAuxJson } from "../guardrails/output";
 import { FileConversationDriver } from "./file-driver";
 import { MongoConversationDriver } from "./mongo-driver";
 import type { Conversation, ConversationDriver, ConversationSummary, StoredMessage } from "./types";
@@ -75,8 +76,38 @@ export async function listConversations(limit = 50): Promise<ConversationSummary
   return (await getDriver()).list(limit);
 }
 
+/**
+ * Read a conversation, repairing answers written while the stream leaked.
+ *
+ * A query planner running inside a retrieval tool used to have its JSON
+ * prepended to the answer. That is fixed at the source, but the answers stored
+ * while it was open still carry it — and this is the one path both readers go
+ * through, so cleaning here fixes the transcript the user sees *and* the turns
+ * replayed into the model's context, which would otherwise keep feeding it its
+ * own planner output as though it were something it had said.
+ *
+ * Done on read rather than by rewriting the stored rows: it is idempotent,
+ * needs no migration, and leaves the original intact in case the repair is
+ * ever wrong about a message.
+ */
 export async function getConversation(id: string): Promise<Conversation | null> {
-  return (await getDriver()).get(id);
+  const conversation = await (await getDriver()).get(id);
+  if (!conversation) return null;
+
+  let repaired = 0;
+  const messages = conversation.messages.map((m) => {
+    if (m.role !== "assistant" || !m.content.startsWith("{")) return m;
+    const cleaned = stripLeakedAuxJson(m.content);
+    if (cleaned === m.content) return m;
+    repaired++;
+    return { ...m, content: cleaned };
+  });
+
+  if (repaired > 0) {
+    console.warn(`[conversations] stripped leaked planner output from ${repaired} stored answer(s)`);
+    return { ...conversation, messages };
+  }
+  return conversation;
 }
 
 export async function appendMessages(

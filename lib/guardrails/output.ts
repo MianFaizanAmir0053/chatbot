@@ -31,10 +31,24 @@ function verdictFor(score: number): GroundednessReport["verdict"] {
 }
 
 export interface GroundednessReport {
+  /**
+   * Fraction of claims supported, or -1 for "not verified".
+   *
+   * -1 is not a low score. It means no judgement was made — the judge was
+   * unavailable, or there was no evidence to judge against — and the interface
+   * shows no badge at all rather than implying a verified result.
+   */
   score: number;
   verdict: "grounded" | "partially_grounded" | "unsupported";
   unsupportedClaims: string[];
   passed: boolean;
+}
+
+/** A web source, with enough of its text for the judge to check a claim against. */
+export interface WebEvidence {
+  title: string;
+  url: string;
+  content?: string;
 }
 
 /**
@@ -58,10 +72,19 @@ const GROUNDEDNESS_MAX_EXCERPTS = 12;
 export async function checkGroundedness(
   answer: string,
   documents: RankedDocument[],
+  web: WebEvidence[] = [],
 ): Promise<GroundednessReport> {
   // Nothing to check against, or an explicit refusal — no claim is being made.
-  if (documents.length === 0 || answer.trim().length < 20) {
-    return { score: 1, verdict: "grounded", unsupportedClaims: [], passed: true };
+  //
+  // Reported as unverified (-1) rather than as a perfect score. The two are not
+  // the same thing, and conflating them was actively misleading: a turn that
+  // researched entirely on the web passed no documents here, took this branch,
+  // and was labelled "Grounded in sources · 100%" without a single claim having
+  // been checked. A measured run produced a confident comparison of two
+  // versions of a web page when only one had ever been fetched, and wore that
+  // badge while doing it.
+  if (answer.trim().length < 20) {
+    return { score: -1, verdict: "grounded", unsupportedClaims: [], passed: true };
   }
 
   // Judge against the passages the answer actually cites, not the whole run's
@@ -93,13 +116,34 @@ export async function checkGroundedness(
   // Ordinals must survive the filter. Renumbering the excerpts here would make
   // the judge's view of "[7]" a different passage from the answer's, and every
   // citation would look unsupported.
-  const excerpts = selected
+  const documentExcerpts = selected
     .sort((a, b) => a.ordinal - b.ordinal)
     .map(
       ({ ranked, ordinal }) =>
         `[${ordinal}] ${String(ranked.doc.metadata?.originalText ?? ranked.doc.pageContent)}`,
-    )
-    .join("\n\n");
+    );
+
+  // Web sources are judged too, in their own `[Wn]` numbering.
+  //
+  // They were previously invisible here: the judge only ever saw documents, so
+  // a web-researched answer was scored against nothing. That is the case most
+  // in need of checking, not least — a retrieved passage is at least something
+  // the user uploaded, whereas a fetched page is whatever a model decided to
+  // read, and a page that failed to load leaves the model free to write what it
+  // expected to find.
+  const webExcerpts = web
+    .filter((w) => w.content?.trim())
+    .slice(0, GROUNDEDNESS_MAX_EXCERPTS)
+    .map((w, i) => `[W${i + 1}] ${w.title} — ${w.url}\n${w.content}`);
+
+  const excerpts = [...documentExcerpts, ...webExcerpts].join("\n\n");
+
+  // Everything gathered was unusable — a failed fetch, or an empty search. The
+  // answer cannot be checked, and saying so is the whole point of this branch.
+  if (excerpts.trim().length === 0) {
+    console.warn("[guardrails] no evidence to check the answer against — reporting unverified");
+    return { score: -1, verdict: "grounded", unsupportedClaims: [], passed: true };
+  }
 
   try {
         const report = await structuredInvoke(getAuxModels("fast"), GroundednessSchema, [
@@ -125,6 +169,84 @@ export async function checkGroundedness(
   } catch (error) {
     console.error("[guardrails] groundedness check failed, passing through:", error);
     return { score: -1, verdict: "grounded", unsupportedClaims: [], passed: true };
+  }
+}
+
+/**
+ * Keys belonging to this system's own auxiliary schemas.
+ *
+ * An object whose keys are drawn only from this set was produced by a planner
+ * or a judge, not written for the user.
+ */
+const AUX_SCHEMA_KEYS = new Set([
+  "variants",
+  "keywords",
+  "hypotheticalAnswer",
+  "groundedness",
+  "unsupportedClaims",
+  "isInjection",
+  "confidence",
+  "rationale",
+]);
+
+/** The end index of the JSON object starting at 0, or -1 if it is not one. */
+function jsonObjectEnd(text: string): number {
+  if (text[0] !== "{") return -1;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (ch === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (ch === '"') {
+      inString = !inString;
+      continue;
+    }
+    if (inString) continue;
+    if (ch === "{") depth++;
+    else if (ch === "}" && --depth === 0) return i + 1;
+  }
+  return -1;
+}
+
+/**
+ * Remove an auxiliary call's output that was prepended to an answer.
+ *
+ * For a while, a query planner invoked inside a retrieval tool had its JSON
+ * streamed into the answer — `{"variants":[…],"hypotheticalAnswer":"…"}` ahead
+ * of the real reply, sometimes three of them. That leak is closed at the stream,
+ * but the answers written while it was open are still in the conversation store,
+ * so they are shown in the transcript and replayed into the model's context on
+ * every later turn of those threads.
+ *
+ * Matched by parsing rather than by pattern, and only when every key belongs to
+ * one of this system's own auxiliary schemas. An answer that legitimately opens
+ * with a JSON object — a reply about configuration, say — has keys this does not
+ * recognise and is left alone.
+ */
+export function stripLeakedAuxJson(text: string): string {
+  let out = text.trimStart();
+  for (;;) {
+    const end = jsonObjectEnd(out);
+    if (end < 0) return out === text.trimStart() ? text : out;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(out.slice(0, end));
+    } catch {
+      return out === text.trimStart() ? text : out;
+    }
+    const keys = Object.keys((parsed ?? {}) as Record<string, unknown>);
+    if (keys.length === 0 || !keys.every((k) => AUX_SCHEMA_KEYS.has(k))) {
+      return out === text.trimStart() ? text : out;
+    }
+    out = out.slice(end).trimStart();
   }
 }
 
@@ -244,10 +366,14 @@ export function normaliseCitations(answer: string): string {
 export function validateCitations(
   answer: string,
   documents: RankedDocument[],
-): { valid: boolean; invalidRefs: number[] } {
+): { valid: boolean; invalidRefs: number[]; refs: number[] } {
   const refs = [...answer.matchAll(/\[(\d+)\]/g)].map((m) => Number(m[1]));
   const invalidRefs = [...new Set(refs.filter((n) => n < 1 || n > documents.length))];
-  return { valid: invalidRefs.length === 0, invalidRefs };
+  // `refs` is returned as well as the verdict, because "no invalid citations"
+  // and "cited its sources" are different claims and only the first is checked
+  // here. An answer with no markers at all is trivially valid, and the caller
+  // needs to be able to tell that apart from one that cited correctly.
+  return { valid: invalidRefs.length === 0, invalidRefs, refs };
 }
 
 /**

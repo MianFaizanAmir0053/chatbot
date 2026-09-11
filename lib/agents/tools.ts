@@ -17,7 +17,15 @@ import { webSearch } from "./websearch";
 
 export interface EvidenceCollector {
   documents: RankedDocument[];
-  webResults: Array<{ title: string; url: string }>;
+  /**
+   * Web sources, each with an excerpt of what was actually read.
+   *
+   * The excerpt is kept because the groundedness judge needs something to check
+   * a web-sourced claim against. Storing only the title and URL made every such
+   * answer unverifiable — and it was then reported as fully grounded, since the
+   * judge had no evidence and treated that as nothing to dispute.
+   */
+  webResults: Array<{ title: string; url: string; content?: string }>;
   searches: string[];
   /**
    * Passage identity to the citation number it was given, for this run.
@@ -269,7 +277,15 @@ export function buildTools(collector: EvidenceCollector, options: ToolOptions = 
       }
 
       for (const r of outcome.results) {
-        if (r.url) collector.webResults.push({ title: r.title, url: r.url });
+        if (r.url) {
+          collector.webResults.push({
+            title: r.title,
+            url: r.url,
+            // The same slice the model is shown, so the judge checks the claim
+            // against exactly the text that produced it.
+            content: r.content.slice(0, 1200),
+          });
+        }
       }
 
       return (
@@ -327,8 +343,15 @@ export function buildTools(collector: EvidenceCollector, options: ToolOptions = 
           .replace(/\s+/g, " ")
           .trim();
 
-        collector.webResults.push({ title: parsed.hostname, url: parsed.toString() });
-        return text.slice(0, 6000) || "Page contained no readable text.";
+        const body = text.slice(0, 6000);
+        collector.webResults.push({
+          title: parsed.hostname,
+          url: parsed.toString(),
+          // Trimmed well below what the model reads: the judge needs enough to
+          // confirm a claim, not the whole page in every guardrail prompt.
+          content: body.slice(0, 2000),
+        });
+        return body || "Page contained no readable text.";
       } catch (error) {
         return `Fetch failed: ${error instanceof Error ? error.message : String(error)}`;
       }

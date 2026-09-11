@@ -491,7 +491,7 @@ export async function POST(req: NextRequest) {
       // run did collect.
       const researched = collector.documents.length > 0 || collector.searches.length > 0;
 
-      emit("error", {
+      const failure = 
         // A third cause, and the only one where the run was never given the
         // chance to answer: the model wrote its tool call in a template the
         // gateway does not parse, so the call was never made and generation
@@ -499,7 +499,7 @@ export async function POST(req: NextRequest) {
         // a budget overrun or a rate limit would send the user to check the
         // wrong thing entirely — the fix is a different provider, not a
         // narrower question or a topped-up balance.
-        message: unexecutedToolCall
+        unexecutedToolCall
           ? "The model tried to search but wrote the request in a format this provider " +
             "does not execute, so nothing was retrieved and it stopped waiting for a result. " +
             "This is a quirk of one provider — asking again will usually land on another one."
@@ -509,8 +509,9 @@ export async function POST(req: NextRequest) {
             `${collector.searches.length} search(es). Asking a narrower question usually gets ` +
             "an answer from the same evidence."
           : "Every configured model provider refused the request — most often a rate limit " +
-            `or an exhausted balance. Details: ${detail}`,
-      });
+            `or an exhausted balance. Details: ${detail}`;
+
+      emit("error", { message: failure });
 
       // The sources are still worth sending: they are what the run actually
       // established, and they let the user see the research rather than only
@@ -529,6 +530,28 @@ export async function POST(req: NextRequest) {
           searches: collector.searches,
         });
       }
+
+      // Record the failure as a turn, rather than leaving the question
+      // unanswered in the transcript.
+      //
+      // The question is stored before the run so an abandoned turn stays
+      // findable. When the run then fails, this path used to return without
+      // writing anything, so the stored thread kept a user message with no
+      // reply — and the user, seeing nothing, asked again. A measured thread
+      // ended up holding the same question three times with two of them
+      // unanswered, all of it replayed into the model's context on every
+      // subsequent turn as questions it had apparently ignored.
+      //
+      // Marked `blocked`, which is the existing flag for "this turn produced no
+      // answer, and here is why" — the same treatment a refused input gets.
+      await appendMessages(thread, [
+        {
+          role: "assistant",
+          content: failure,
+          blocked: true,
+          createdAt: new Date().toISOString(),
+        },
+      ]);
       return;
     }
 
@@ -553,7 +576,34 @@ export async function POST(req: NextRequest) {
       answer = cleaned;
     }
 
-    const grounded = await checkGroundedness(answer, collector.documents);
+    // A substantive answer that cites nothing, when there was evidence to cite.
+    //
+    // Citation validation cannot catch this: it looks for markers and checks
+    // that each resolves, so an answer with no markers has nothing invalid in
+    // it and passes. The gap is not theoretical — a delegated turn whose
+    // researcher returned malformed markers had them all stripped, and what
+    // reached the user was a long, confident, entirely uncited answer that
+    // every check called clean.
+    if (
+      citations.refs.length === 0 &&
+      answer.trim().length > 400 &&
+      (collector.documents.length > 0 || collector.webResults.length > 0)
+    ) {
+      console.warn(
+        `[chat] answer cites nothing despite ${collector.documents.length} passage(s) and ` +
+          `${collector.webResults.length} web source(s)`,
+      );
+      emit("warning", {
+        message:
+          "This answer does not cite any of the sources the run retrieved, so individual " +
+          "claims cannot be traced back. Treat it as a summary rather than as sourced.",
+      });
+    }
+
+    // Web sources are judged alongside the documents. Passing only documents
+    // meant a web-researched answer reached the judge with no evidence at all,
+    // which it treated as nothing to dispute and scored as fully grounded.
+    const grounded = await checkGroundedness(answer, collector.documents, collector.webResults);
     emit("groundedness", {
       score: grounded.score,
       verdict: grounded.verdict,

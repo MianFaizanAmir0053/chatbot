@@ -78,13 +78,28 @@ const ACCOUNT_REFUSED =
  * temporary. Those are properties of the moment; these are properties of the
  * account.
  */
+/**
+ * A rate limit measured in days rather than minutes.
+ *
+ * Matched narrowly and only on the word "daily" or an explicit "per day". Most
+ * 429s are per-minute and are exactly what the backoff exists to ride out, so
+ * the bar for treating one as unrecoverable has to be an explicit statement
+ * that the window is a day. "You exceeded your current quota" deliberately does
+ * not match: several gateways send that for a per-minute limit that clears in
+ * seconds.
+ */
+const DAILY_LIMIT = /\b(daily|per[- ]day|\/day|a day)\b/i;
+
 export function isPermanentRefusal(error: unknown): boolean {
   const status = statusOf(error);
   if (status === 401 || status === 403) return true;
-  if (status === 400) {
-    const message = String((error as { message?: unknown })?.message ?? "");
-    return ACCOUNT_REFUSED.test(message);
-  }
+  const message = String((error as { message?: unknown })?.message ?? "");
+  if (status === 400) return ACCOUNT_REFUSED.test(message);
+  // A daily ceiling will not clear inside a request. Retrying it four times
+  // across thirty seconds of backoff was observed costing a research branch
+  // its entire budget for a limit that had hours left to run — and because a
+  // fan-out waits on its slowest branch, that was the whole turn.
+  if (status === 429) return DAILY_LIMIT.test(message);
   return false;
 }
 

@@ -250,10 +250,40 @@ export function validateCitations(
   return { valid: invalidRefs.length === 0, invalidRefs };
 }
 
-/** Strip any citation markers that don't resolve, rather than showing broken refs. */
+/**
+ * Strip any citation markers that don't resolve, rather than showing broken refs.
+ *
+ * Removing a marker leaves the punctuation that framed it behind, and citations
+ * are usually written in runs — "SAE 10W-40 grade oil [3], [4]." strips to
+ * "grade oil , .", which reads as a typo the model made rather than as
+ * something removed here. So the wreckage is tidied too.
+ *
+ * The tidying runs only when a marker was actually removed. Applied
+ * unconditionally it would edit answers nothing was stripped from, and a rule
+ * like "close the space before a comma" is a reasonable thing to do to damage
+ * this function caused but not to prose a model deliberately wrote.
+ */
 export function stripInvalidCitations(answer: string, documents: RankedDocument[]): string {
-  return answer.replace(/\[(\d+)\]/g, (match, n) => {
+  let removed = 0;
+  const stripped = answer.replace(/\[(\d+)\]/g, (match, n) => {
     const idx = Number(n);
-    return idx >= 1 && idx <= documents.length ? match : "";
+    if (idx >= 1 && idx <= documents.length) return match;
+    removed++;
+    return "";
   });
+
+  if (removed === 0) return answer;
+
+  return (
+    stripped
+      // The space that used to sit between the text and its marker.
+      .replace(/[ \t]+([,;:.!?])/g, "$1")
+      // A separator whose other side is gone: "oil , ." and "oil ,," .
+      .replace(/([,;])[ \t]*(?=[.!?])/g, "")
+      .replace(/([,;])(?:[ \t]*[,;])+/g, "$1")
+      // A run of markers mid-sentence collapses several spaces into one.
+      .replace(/[ \t]{2,}/g, " ")
+      // A marker at the end of a line leaves the line trailing whitespace.
+      .replace(/[ \t]+$/gm, "")
+  );
 }

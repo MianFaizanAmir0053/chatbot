@@ -17,6 +17,7 @@
  */
 
 import { GUARDRAIL_CONFIG } from "../lib/config";
+import { MAX_REPLAYED_CHARS, replayable } from "../lib/conversations/replay";
 import { ChatRequestSchema } from "../lib/guardrails/input";
 
 let failures = 0;
@@ -69,8 +70,66 @@ function theReportedFailure() {
   );
 }
 
+function replayBudget() {
+  banner("2. Restoring a thread must not spend the window on its own history");
+
+  const long = (n: number) => "x".repeat(n);
+
+  // Twelve turns is the cap, but twelve *long* turns is most of a context
+  // window before the current question is read — and this system writes long
+  // answers, so that is the normal case rather than the extreme one.
+  // Numbered so which turns survived is visible, not just how many.
+  const bigThread = Array.from({ length: 12 }, (_, i) => ({
+    role: i % 2 === 0 ? "user" : "assistant",
+    content: `turn-${i} ${long(4000)}`,
+  }));
+  const kept = replayable(bigThread);
+  const chars = kept.reduce((n, t) => n + t.content.length, 0);
+
+  check("the character budget is respected", chars <= MAX_REPLAYED_CHARS, `${chars} chars`);
+  check("and something is still replayed", kept.length > 0, `${kept.length} turn(s)`);
+  check(
+    "it is the most recent turns that survive, not the oldest",
+    kept.at(-1)?.content.startsWith("turn-11") === true &&
+      kept[0].content.startsWith("turn-") &&
+      !kept[0].content.startsWith("turn-0 "),
+    `kept ${kept.map((t) => t.content.split(" ")[0]).join(", ")}`,
+  );
+
+  // One enormous answer must not swallow the whole budget and crowd out the
+  // turns that carry the references.
+  const withGiant = [
+    { role: "assistant", content: long(50_000) },
+    { role: "user", content: "and the second one?" },
+    { role: "assistant", content: "The second is 225 kPa." },
+  ];
+  const trimmed = replayable(withGiant);
+  check(
+    "a single huge turn is truncated, not dropped whole",
+    trimmed.some((t) => t.content.includes("[…truncated]")),
+    trimmed.map((t) => t.content.length).join(", "),
+  );
+  check(
+    "and the turns after it survive",
+    trimmed.some((t) => t.content === "and the second one?"),
+    "the referential ones",
+  );
+
+  // A short conversation is replayed exactly as stored.
+  const small = [
+    { role: "user", content: "what is the oil capacity" },
+    { role: "assistant", content: "3.4 litres [1]." },
+  ];
+  check(
+    "a short thread is replayed verbatim",
+    JSON.stringify(replayable(small)) === JSON.stringify(small),
+    "unchanged",
+  );
+  check("an empty thread replays nothing", replayable([]).length === 0);
+}
+
 function theNewShape() {
-  banner("2. What the client sends now");
+  banner("3. What the client sends now");
 
   const current = ChatRequestSchema.safeParse({
     message: "what is the engine oil capacity",
@@ -100,7 +159,7 @@ function theNewShape() {
 }
 
 function stillGuarded() {
-  banner("3. The limit that still matters");
+  banner("4. The limit that still matters");
 
   // Dropping the transcript's ceiling must not drop the real one. This is the
   // text the user typed, and the cap is a guard against prompt-stuffing.
@@ -119,6 +178,7 @@ function stillGuarded() {
 
 function main() {
   theReportedFailure();
+  replayBudget();
   theNewShape();
   stillGuarded();
 

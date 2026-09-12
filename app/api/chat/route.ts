@@ -9,6 +9,7 @@ import {
   visibleText,
 } from "@/lib/agents/stream-filter";
 import { appendMessages, getConversation, scopeChainFor } from "@/lib/conversations/store";
+import { replayable } from "@/lib/conversations/replay";
 import { hasReasoningProvider } from "@/lib/config";
 import { refusedCredentials } from "@/lib/credential-health";
 import { ChatRequestSchema, guardInput } from "@/lib/guardrails/input";
@@ -26,14 +27,6 @@ export const runtime = "nodejs";
 // The agent loop can run well past the default serverless budget on multi-step
 // questions, so ask for the maximum the platform will grant.
 export const maxDuration = 300;
-
-/**
- * How much of a stored transcript is replayed into a thread whose checkpoint
- * is gone. Every replayed turn is context the model pays for on this turn, so
- * this trades recall against cost; the most recent turns carry nearly all of
- * the referential weight ("it", "the second one") that replay exists to serve.
- */
-const MAX_REPLAYED_TURNS = 12;
 
 /**
  * One structured line per turn, for finding the failures that do not throw.
@@ -287,13 +280,18 @@ export async function POST(req: NextRequest) {
         const stored = await getConversation(thread);
         // The turn just recorded above is the incoming question — replaying it
         // would send it twice.
-        const earlier = (stored?.messages ?? []).slice(0, -1).slice(-MAX_REPLAYED_TURNS);
+        const earlier = replayable((stored?.messages ?? []).slice(0, -1));
         for (const turn of earlier) {
           priorMessages.push(
             turn.role === "user" ? new HumanMessage(turn.content) : new AIMessage(turn.content),
           );
         }
         if (priorMessages.length > 0) {
+          const replayedChars = earlier.reduce((n, t) => n + t.content.length, 0);
+          console.log(
+            `[chat] replaying ${earlier.length} turn(s), ${replayedChars} chars ` +
+              `(of ${(stored?.messages ?? []).length - 1} stored)`,
+          );
           emit("status", {
             stage: "restoring context",
             detail: `${priorMessages.length} earlier turn(s)`,

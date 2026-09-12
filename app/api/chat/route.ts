@@ -9,7 +9,6 @@ import {
   visibleText,
 } from "@/lib/agents/stream-filter";
 import { appendMessages, getConversation, scopeChainFor } from "@/lib/conversations/store";
-import { batchQualifiesForVerification } from "@/lib/agents/subagents";
 import { hasReasoningProvider } from "@/lib/config";
 import { refusedCredentials } from "@/lib/credential-health";
 import { ChatRequestSchema, guardInput } from "@/lib/guardrails/input";
@@ -209,6 +208,19 @@ export async function POST(req: NextRequest) {
       // alone would find nothing and confidently report that the documents do
       // not cover the question.
       threadId: await scopeChainFor(thread),
+      // Branch progress, forwarded as it happens.
+      //
+      // The delegation tool returns one value after its slowest branch, so
+      // without this the interface could say only that research was under way
+      // — measured at around eighty seconds of it, most spent with findings
+      // already in hand and no way to show them.
+      onBranch: (e) => {
+        if (e.phase === "start") {
+          emit("delegation", { id: e.id, agent: e.researcher, task: e.question });
+        } else {
+          emit("delegation_done", { id: e.id, outcome: e.outcome, ms: e.ms });
+        }
+      },
     });
 
     let answer = "";
@@ -226,8 +238,6 @@ export async function POST(req: NextRequest) {
     const reportedCalls = new Set<string>();
     /** Tool results already reported, for the same reason. */
     const reportedResults = new Set<string>();
-    /** The automatic verification branch is announced once per turn. */
-    let verificationShown = false;
     /**
      * The model wrote a tool call as text rather than calling the tool.
      *
@@ -410,33 +420,16 @@ export async function POST(req: NextRequest) {
               // as five identical "task" rows says nothing about which
               // sub-questions are being researched or by whom.
               if (call.name === "delegate_research") {
-                const args = (call.args ?? {}) as {
-                  tasks?: Array<{ researcher?: string; question?: string }>;
-                };
-                // One call starts a whole batch, so report each branch
-                // separately — the fan-out is precisely what the user is
-                // waiting on, and a single "delegate_research" row hides it.
-                const tasks = args.tasks ?? [];
-                tasks.forEach((t, i) => {
-                  emit("delegation", {
-                    id: `${id}:${i}`,
-                    agent: t.researcher ?? "researcher",
-                    task: t.question ?? "",
-                  });
-                });
-
-                // The adversarial check runs inside the tool rather than being
-                // requested by the model, so it appears in no tool call. Left
-                // unreported the user watches every researcher finish and then
-                // waits through an unexplained pause while it runs.
-                if (!verificationShown && batchQualifiesForVerification(tasks)) {
-                  verificationShown = true;
-                  emit("delegation", {
-                    id: `${id}:verify`,
-                    agent: "verifier",
-                    task: "Attacking the findings: exceptions, conditions, limits, conflicts",
-                  });
-                }
+                // Announced by the tool itself, as each branch starts.
+                //
+                // It used to be announced from these arguments, which was the
+                // only channel available but reported a plan rather than what
+                // happened: branches appeared the moment the model asked for
+                // them and all closed together when the last one finished, so
+                // a branch that failed in five seconds looked identical to one
+                // that ran for ninety. The verifier was worse — it is started
+                // by the tool, not requested by the model, so it had to be
+                // guessed at from a predicate.
                 continue;
               }
 

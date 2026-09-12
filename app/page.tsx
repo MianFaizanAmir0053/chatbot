@@ -56,6 +56,8 @@ type Delegation = {
   agent: string;
   task: string;
   done: boolean;
+  /** How it ended. A failed branch researched nothing and must not read as done. */
+  outcome?: "ok" | "partial" | "failed";
 };
 
 const AGENT_LABELS: Record<string, string> = {
@@ -311,6 +313,7 @@ function TracePanel({ trace }: { trace: TraceEntry[] }) {
  */
 function DelegationPanel({ delegations }: { delegations: Delegation[] }) {
   const running = delegations.filter((d) => !d.done).length;
+  const failed = delegations.filter((d) => d.outcome === "failed").length;
   const [open, setOpen] = useState(true);
 
   if (delegations.length === 0) return null;
@@ -330,6 +333,13 @@ function DelegationPanel({ delegations }: { delegations: Delegation[] }) {
         {delegations.length} researcher{delegations.length === 1 ? "" : "s"}
         {running > 0 ? (
           <span style={{ color: "var(--accent-color)" }}>· {running} running</span>
+        ) : failed > 0 ? (
+          // A failed branch researched nothing, and rolling it into "all
+          // reported" hides the one thing worth knowing about the answer that
+          // follows: part of the question was never looked into.
+          <span style={{ color: "var(--danger, var(--accent-color))" }}>
+            · {failed} did not complete
+          </span>
         ) : (
           <span className="text-muted-foreground">· all reported</span>
         )}
@@ -343,11 +353,23 @@ function DelegationPanel({ delegations }: { delegations: Delegation[] }) {
                 className={`absolute -left-[18px] top-[5px] h-1.5 w-1.5 rounded-full ${
                   d.done ? "" : "animate-pulse"
                 }`}
-                style={{ background: d.done ? "var(--ok, var(--line-strong))" : "var(--accent-color)" }}
+                style={{
+                  background: !d.done
+                    ? "var(--accent-color)"
+                    : d.outcome === "failed"
+                      ? "var(--danger, var(--line-strong))"
+                      : "var(--ok, var(--line-strong))",
+                }}
               />
               <span className="text-foreground font-medium">
                 {AGENT_LABELS[d.agent] ?? d.agent}
               </span>
+              {d.outcome === "failed" && (
+                <span style={{ color: "var(--danger, var(--muted-foreground))" }}> · failed</span>
+              )}
+              {d.outcome === "partial" && (
+                <span className="text-muted-foreground"> · partial</span>
+              )}
               {d.task && <span className="text-muted-foreground"> — {d.task}</span>}
             </li>
           ))}
@@ -881,15 +903,27 @@ export default function ChatPage() {
               break;
             }
 
-            case "delegation_result":
-              // One batch resolves as a single tool result, so every branch it
-              // started finishes at the same moment. Branch ids are prefixed
-              // with the batch's own id, which is what pairs them up.
+            case "delegation_done":
+              // One branch, closed the moment it settles. Branches finish at very
+              // different times, and closing them together made a five-second
+              // failure look like a ninety-second success.
               patch((m) => ({
                 ...m,
                 delegations: (m.delegations ?? []).map((d) =>
-                  d.id.startsWith(`${String(data.batchId)}:`) ? { ...d, done: true } : d,
+                  d.id === String(data.id)
+                    ? { ...d, done: true, outcome: data.outcome as Delegation["outcome"] }
+                    : d,
                 ),
+              }));
+              break;
+
+            case "delegation_result":
+              // The batch returned. A branch still open here settled without
+              // its event arriving, so this closes whatever is left rather
+              // than leaving a spinner running for the rest of the turn.
+              patch((m) => ({
+                ...m,
+                delegations: (m.delegations ?? []).map((d) => (d.done ? d : { ...d, done: true })),
               }));
               break;
 

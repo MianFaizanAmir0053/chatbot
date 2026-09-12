@@ -5,7 +5,7 @@ import { GUARDRAIL_CONFIG, SUBAGENT_CONFIG, type ThinkingMode } from "../config"
 import { getModel } from "../models";
 import type { ThreadScope } from "../vectorstore";
 import { buildMiddleware } from "./middleware";
-import { buildDelegationTool } from "./subagents";
+import { buildDelegationTool, type BranchEvent } from "./subagents";
 import { buildTools, createEvidenceCollector, type EvidenceCollector } from "./tools";
 
 /**
@@ -303,6 +303,15 @@ export interface AgentOptions {
    * never appears in the answer directly.
    */
   threadId?: ThreadScope;
+  /**
+   * Called as each research branch starts and settles.
+   *
+   * Passed through to the delegation tool, which is otherwise unreachable from
+   * the caller: it hands its result to the model, not to whoever started the
+   * run, so without this the interface learns nothing until every branch has
+   * finished.
+   */
+  onBranch?: (event: BranchEvent) => void;
 }
 
 /**
@@ -344,7 +353,9 @@ export function buildAgent(options: AgentOptions = {}): AgentRun {
       // sub-question per call and depends on the model batching several calls
       // into one message to fan out — which the providers here do not do. See
       // buildDelegationTool for the measurement.
-    ...(deepAgents ? [buildDelegationTool(collector, { webSearch, resultCache, threadId })] : []),
+    ...(deepAgents
+      ? [buildDelegationTool(collector, { webSearch, resultCache, threadId, onBranch: options.onBranch })]
+      : []),
   ];
 
   const agent = createAgent({

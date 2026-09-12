@@ -15,7 +15,7 @@ import {
 import { AIMessage } from "@langchain/core/messages";
 import { ChatOpenAI } from "@langchain/openai";
 import { FALLBACK_MODELS, GUARDRAIL_CONFIG, SUBAGENT_CONFIG, env, features } from "../config";
-import { isPermanentRefusal } from "../credential-health";
+import { isWorthRetrying } from "../credential-health";
 import { getFallbackModels, getModel } from "../models";
 
 
@@ -99,7 +99,15 @@ export function buildMiddleware(options: MiddlewareOptions = {}) {
     middleware.push(
       toolCallLimitMiddleware({
         toolName: "delegate_research",
-        runLimit: SUBAGENT_CONFIG.MAX_DELEGATION_ROUNDS,
+        // One above the ceiling, because the ceiling itself is enforced inside
+        // the tool now. This middleware blocks with a generic error and no
+        // instruction, and a supervisor that hit it ended the turn with no
+        // answer at all — twice, with findings already gathered. The tool
+        // refuses the same call with "answer now from what you have", which is
+        // the outcome worth having, so it must be the one the model sees.
+        // Kept installed one round higher as a backstop for a model that
+        // ignores that instruction and calls again regardless.
+        runLimit: SUBAGENT_CONFIG.MAX_DELEGATION_ROUNDS + 1,
         exitBehavior: "continue",
       }),
     );
@@ -142,7 +150,7 @@ export function buildMiddleware(options: MiddlewareOptions = {}) {
       // Only refusals of the credential itself are excluded here. Everything
       // ambiguous still retries, because the backoff exists for rate limits and
       // those are precisely the errors worth waiting out.
-      retryOn: (error: Error) => !isPermanentRefusal(error),
+      retryOn: (error: Error) => isWorthRetrying(error),
     }),
   );
 

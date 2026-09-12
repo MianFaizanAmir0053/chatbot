@@ -79,20 +79,51 @@ const ACCOUNT_REFUSED =
  * account.
  */
 /**
- * A rate limit measured in days rather than minutes.
+ * A rate limit measured in days or months rather than minutes.
  *
  * Matched narrowly and only on the word "daily" or an explicit "per day". Most
  * 429s are per-minute and are exactly what the backoff exists to ride out, so
  * the bar for treating one as unrecoverable has to be an explicit statement
- * that the window is a day. "You exceeded your current quota" deliberately does
+ * that the window is long. "You exceeded your current quota" deliberately does
  * not match: several gateways send that for a per-minute limit that clears in
  * seconds.
+ *
+ * A month matters as much as a day here. Cohere trial keys are capped at 1000
+ * calls per month and say so in the 429 — a ceiling that will not clear inside
+ * any process lifetime, and one that was being re-tried by every concurrent
+ * query variant of every search.
  */
-const DAILY_LIMIT = /\b(daily|per[- ]day|\/day|a day)\b/i;
+const DAILY_LIMIT =
+  /\b(daily|monthly)\b|\bper[\s-]*(day|month)\b|\/\s*(day|month)\b|\bin\s+a\s+(day|month)\b/i;
+
+/**
+ * Language that means the moment, not the account — on a status that usually
+ * means the account.
+ *
+ * Alibaba's MaaS free tier reports a *per-model* token budget as
+ * `403 Free quota exhausted. ... please add funds or disable the "use free tier
+ * only" mode`, rejected in ~130ms before any inference. Measured against a live
+ * key: the same key answered every other model at `max_tokens: 2048` while one
+ * heavily-used model refused anything above ~128, and that model recovered on
+ * its own. So the 403 describes a model's bucket at an instant, not a dead
+ * credential — and condemning the key for thirty minutes over it costs every
+ * other model the key can still serve.
+ *
+ * Only consulted alongside a 403, which is otherwise a genuine permission
+ * failure and must stay permanent.
+ */
+const THROTTLE =
+  /\b(quota|rate[ _-]?limit|too many requests|throttl\w*|concurrenc\w+|requests? per|tokens? per)\b/i;
 
 export function isPermanentRefusal(error: unknown): boolean {
   const status = statusOf(error);
-  if (status === 401 || status === 403) return true;
+  const detail = String((error as { message?: unknown })?.message ?? "");
+  if (status === 401) return true;
+  // A 403 is normally the account: the key is real and not allowed to do this.
+  // But a gateway that meters a free tier per model reports that as a 403 too,
+  // and that one clears — so it is treated like a 429, permanent only if the
+  // window is stated in days. See THROTTLE.
+  if (status === 403) return THROTTLE.test(detail) ? DAILY_LIMIT.test(detail) : true;
   // 402 is the least ambiguous refusal there is: the credential is valid and
   // the account cannot pay. No retry within a request can change that, and no
   // backoff is short enough to outlast it. A live DeepSeek key returned 402
@@ -100,16 +131,44 @@ export function isPermanentRefusal(error: unknown): boolean {
   // listing its models — so nothing short of the status distinguishes it from
   // a working key until the completion is attempted.
   if (status === 402) return true;
-  const message = String((error as { message?: unknown })?.message ?? "");
   // Some gateways report the same condition as a 400 with the reason in the
   // text rather than in the status.
-  if (status === 400) return ACCOUNT_REFUSED.test(message);
+  if (status === 400) return ACCOUNT_REFUSED.test(detail);
   // A daily ceiling will not clear inside a request. Retrying it four times
   // across thirty seconds of backoff was observed costing a research branch
   // its entire budget for a limit that had hours left to run — and because a
   // fan-out waits on its slowest branch, that was the whole turn.
-  if (status === 429) return DAILY_LIMIT.test(message);
+  if (status === 429) return DAILY_LIMIT.test(detail);
   return false;
+}
+
+/**
+ * Whether waiting and trying the same model again could plausibly work.
+ *
+ * Distinct from `isPermanentRefusal`, which asks a different question: whether
+ * the *credential* should leave the rotation. Conflating the two costs real
+ * time, because there is a third case that is neither.
+ *
+ * Alibaba's free tier meters per model. A drained bucket is rejected in ~130ms
+ * with a 403 before any inference, and it does not refill within a request — so
+ * the key is fine, other models on it are fine, and retrying *this* model is
+ * guaranteed to fail. Measured on a live fan-out: one branch spent 33.2 seconds
+ * on four attempts against a drained bucket and failed anyway, while its four
+ * siblings finished in 3 to 15 seconds. The turn then reported rate limits
+ * instead of an answer, because a fan-out waits on its slowest branch.
+ *
+ * Returning false here hands the call straight to the fallback chain, which is
+ * a *different provider* and therefore a different bucket — the only thing that
+ * can actually succeed.
+ */
+export function isWorthRetrying(error: unknown): boolean {
+  if (isPermanentRefusal(error)) return false;
+  // A per-model quota rejected before inference. Backoff cannot refill it; only
+  // another provider can serve the call.
+  if (statusOf(error) === 403 && THROTTLE.test(String((error as { message?: unknown })?.message ?? ""))) {
+    return false;
+  }
+  return true;
 }
 
 /**

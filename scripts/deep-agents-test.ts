@@ -624,6 +624,40 @@ async function concurrency() {
     throttled,
     `${collector.documents.length} passages gathered`,
   );
+
+  /**
+   * The delegation ceiling must send the supervisor to synthesis, not silence.
+   *
+   * Free to test here: the two invokes above have already used both rounds, so
+   * a third trips the ceiling before any branch starts.
+   *
+   * What this guards is the worst outcome this system can produce. The
+   * tool-call limiter blocks an over-limit call with a generic error and no
+   * instruction, and a supervisor that hit it ended the turn with an empty
+   * answer while holding findings — recorded against the previous provider in
+   * SUBAGENT_CONFIG.MAX_DELEGATION_ROUNDS ("hit the cap and finished with an
+   * empty answer after 344 seconds"), then reproduced twice on qwen3.8-max,
+   * which delegates in incremental rounds rather than one batch. Lowering the
+   * cap made it rarer without removing it.
+   */
+  const overLimit = await invoke([
+    { researcher: "document-researcher", question: "One round too many." },
+  ]);
+  check(
+    "the delegation ceiling refuses with an instruction to answer",
+    /DELEGATION LIMIT REACHED/.test(overLimit) && /answer now/i.test(overLimit),
+    overLimit.replace(/\s+/g, " ").slice(0, 120),
+  );
+  check(
+    "and tells the supervisor how much evidence it holds",
+    /You already have [1-9]\d* finding/.test(overLimit),
+    /You already have (\d+) finding/.exec(overLimit)?.[0] ?? "no finding count in the refusal",
+  );
+  check(
+    "without starting another branch",
+    !/Finding 1 of/.test(overLimit),
+    "refused before dispatch",
+  );
 }
 
 /* ------------------------------------------------------------------ *

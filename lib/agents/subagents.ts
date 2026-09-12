@@ -10,7 +10,7 @@ import { HumanMessage } from "@langchain/core/messages";
 import { setMaxListeners } from "events";
 import { z } from "zod";
 import { SUBAGENT_CONFIG } from "../config";
-import { isPermanentRefusal } from "../credential-health";
+import { isWorthRetrying } from "../credential-health";
 import { normaliseCitations } from "../guardrails/output";
 import { getSubagentFallbackModels, getSubagentModel } from "../models";
 import type { ThreadScope } from "../vectorstore";
@@ -172,7 +172,7 @@ function subagentMiddleware(toolNames: string[] = []): AnyAgentMiddleware[] {
       // As on the supervisor: a refused credential cannot be retried into
       // working, and a branch that spends its backoff discovering that is a
       // branch the whole fan-out waits on for nothing.
-      retryOn: (error: Error) => !isPermanentRefusal(error),
+      retryOn: (error: Error) => isWorthRetrying(error),
     }),
     toolRetryMiddleware({ maxRetries: 2, backoffFactor: 2, onFailure: "continue" }),
   ];
@@ -390,6 +390,16 @@ export function buildDelegationTool(
   let roundSeq = 0;
 
   /**
+   * Sub-questions actually reported back this turn.
+   *
+   * Only needed so the refusal at the delegation ceiling can tell the
+   * supervisor how much evidence it is already holding — "answer from what you
+   * have" is ignorable advice when the model has no idea whether that is four
+   * findings or none.
+   */
+  let findingsDelivered = 0;
+
+  /**
    * Whether this turn's adversarial check has already run.
    *
    * Held per tool instance, and `buildDelegationTool` is called once per
@@ -504,7 +514,15 @@ export function buildDelegationTool(
       // unavailable — which the supervisor cannot otherwise tell apart.
       if (/^Model call failed after \d+ attempts/.test(text.trim())) {
         done("EXHAUSTED");
-        console.warn(`[delegate] ${researcher} exhausted its retries`);
+        // The provider's own words, not just the fact of exhaustion. Without
+        // them a branch failure is indistinguishable from any other, and the
+        // distinction is the whole diagnosis: a 429 burst limit means try
+        // again, a 402 means the account is empty, and a quota-worded 403
+        // means one model's bucket rather than a dead key.
+        console.warn(
+          `[delegate] ${researcher} exhausted its retries: ` +
+            text.replace(/\s+/g, " ").slice(0, 200),
+        );
         return (
           `${label}\nFAILED — the model provider refused every attempt ` +
           `(${text.replace(/\s+/g, " ").slice(0, 160)}).\n` +
@@ -565,6 +583,35 @@ export function buildDelegationTool(
     async ({ tasks }: { tasks: Array<{ researcher: ResearcherName; question: string }> }) => {
       const batch = tasks.slice(0, SUBAGENT_CONFIG.MAX_BRANCHES_PER_ROUND);
       if (batch.length === 0) return "No tasks supplied. Provide at least one sub-question.";
+
+      // The delegation ceiling, enforced here rather than left to the tool-call
+      // limiter alone.
+      //
+      // `toolCallLimitMiddleware` blocks an over-limit call with a generic error
+      // and no instruction, and the supervisor then ended the turn with no
+      // answer at all. Measured twice against qwen3.8-max, which delegates in
+      // incremental rounds — four branches, then two, then a third attempt —
+      // rather than one batch: both runs had findings in hand and produced a
+      // zero-character answer, while a run that happened to stop at two rounds
+      // answered in full with twelve resolving citations. An empty answer is
+      // the worst outcome available to this system, so the refusal says what to
+      // do next instead of only that the door is shut.
+      //
+      // The limiter stays installed one round above this as a backstop, for the
+      // case where a model ignores the instruction and calls again anyway.
+      if (roundSeq >= SUBAGENT_CONFIG.MAX_DELEGATION_ROUNDS) {
+        console.warn(
+          `[delegate] delegation ceiling reached after ${roundSeq} round(s) — ` +
+            `instructing synthesis from ${findingsDelivered} finding(s)`,
+        );
+        return (
+          `DELEGATION LIMIT REACHED — no further research is available on this turn.\n\n` +
+          `You already have ${findingsDelivered} finding(s) returned above. Write your final ` +
+          `answer now from that evidence: state what it supports, cite it, and say plainly ` +
+          `which parts of the question you could not check. Do not call delegate_research ` +
+          `again — it will return this same message.`
+        );
+      }
 
       // Rounds are numbered so a second delegation's branches cannot be
       // mistaken for the first's still running.
@@ -632,6 +679,8 @@ export function buildDelegationTool(
           ),
         );
       }
+
+      findingsDelivered += findings.length;
 
       return (
         `${findings.length} finding(s)${substantial ? " and an adversarial check" : ""}:\n\n` +

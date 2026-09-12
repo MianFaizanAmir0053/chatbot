@@ -15,6 +15,7 @@ import {
   credentialId,
   isPermanentRefusal,
   isRefused,
+  isWorthRetrying,
   noteFailure,
   refusedCredentials,
   resetCredentialHealth,
@@ -58,6 +59,24 @@ function classification() {
   );
   check("a bad key is permanent", isPermanentRefusal(apiError(401, "Invalid Authentication")));
   check("so is a forbidden account", isPermanentRefusal(apiError(403, "Forbidden")));
+  // But not every 403 is the account. Alibaba's MaaS free tier reports a
+  // per-model token budget this way, and it clears: measured against a live
+  // key, one heavily-used model refused `max_tokens` above ~128 while the same
+  // key served every other model at 2048, and the refusing model recovered.
+  check(
+    "a free-tier throttle reported as 403 is not",
+    !isPermanentRefusal(
+      apiError(
+        403,
+        'Free quota exhausted. To continue accessing the model on a paid basis, please add funds or disable the "use free tier only" mode in the management console.',
+      ),
+    ),
+    "measured against a live Alibaba MaaS key",
+  );
+  check(
+    "unless that throttle states a daily window",
+    isPermanentRefusal(apiError(403, "Free quota exhausted: daily limit reached")),
+  );
   check(
     "and a revoked key",
     isPermanentRefusal(apiError(400, "The api key is invalid_api_key or revoked")),
@@ -93,7 +112,26 @@ function classification() {
     isPermanentRefusal(apiError(400, "Your account has a billing problem")),
   );
 
+  // A monthly ceiling outlasts any process. Cohere trial keys are capped at
+  // 1000 calls a month and say so, and that key was being re-tried by every
+  // concurrent query variant of every search.
+  check(
+    "a monthly quota is unrecoverable too",
+    isPermanentRefusal(
+      apiError(429, "You are using a Trial key, which is limited to 1000 API calls / month."),
+    ),
+    "live Cohere wording — note the spaces around the slash",
+  );
+
   check("a plain rate limit is not", !isPermanentRefusal(apiError(429, "Rate limit reached")), "429");
+  // The exact message this deployment sees most. It names a window of minutes,
+  // which is precisely what the backoff exists to wait out — and it contains a
+  // number followed by "m", so a looser pattern could read it as a month.
+  check(
+    "nor a per-minute limit that states its wait",
+    !isPermanentRefusal(apiError(429, "Rate limit reached. Please try again in 22m16.176s")),
+    "minutes, not months",
+  );
   // Deliberately not matched: several gateways send this for a per-minute
   // window that clears in seconds, and the backoff is there to wait it out.
   check(
@@ -119,8 +157,44 @@ function classification() {
   check("nor a model-not-found", !isPermanentRefusal(apiError(404, "model not found")), "404");
 }
 
+function retrying() {
+  banner("2. Is another attempt at the same model worth the wait?");
+
+  // A different question from "should this credential leave the rotation", and
+  // the gap between them is where the time goes.
+  const freeTier = apiError(
+    403,
+    'Free quota exhausted. To continue accessing the model on a paid basis, please add funds or disable the "use free tier only" mode.',
+  );
+  check(
+    "a drained per-model bucket keeps its credential",
+    !isPermanentRefusal(freeTier),
+    "other models on the key still work",
+  );
+  check(
+    "but is not retried against the same model",
+    !isWorthRetrying(freeTier),
+    "measured: 33.2s across four attempts, then failed anyway",
+  );
+
+  // Everything the backoff exists for must still be retried.
+  check(
+    "a per-minute rate limit is retried",
+    isWorthRetrying(apiError(429, "Rate limit reached. Please try again in 22m16.176s")),
+  );
+  check("an outage is retried", isWorthRetrying(apiError(503, "Service Unavailable")));
+  check(
+    "a transport failure is retried",
+    isWorthRetrying(Object.assign(new Error("fetch failed"), { code: "UND_ERR_CONNECT_TIMEOUT" })),
+  );
+
+  // And nothing already condemned should be retried as well as dropped.
+  check("a restricted account is not retried", !isWorthRetrying(apiError(400, "Organization has been restricted")));
+  check("nor an exhausted balance", !isWorthRetrying(apiError(402, "Insufficient Balance")));
+}
+
 function rotation() {
-  banner("2. A refused credential leaves the pool");
+  banner("3. A refused credential leaves the pool");
   resetCredentialHealth();
 
   const keys = ["k1", "k2", "k3"];
@@ -161,6 +235,7 @@ function rotation() {
 
 function main() {
   classification();
+  retrying();
   rotation();
 
   banner("Summary");

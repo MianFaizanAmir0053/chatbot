@@ -142,8 +142,14 @@ async function main() {
     "What is the maximum towing capacity specified in the manual?",
     "absent",
   );
+  // Matches a negation near a "the documents say it" verb, rather than a fixed
+  // list of conjugations. The list missed a correct refusal once already: the
+  // answer read "The documents don't specify a towing capacity", which has
+  // neither "doesn't" nor "specified" in it, and a plural subject makes "don't
+  // specify" the natural phrasing. The companion assertion below is what guards
+  // against fabrication, so this one only has to recognise a refusal.
   const refuses =
-    /not (specified|mentioned|provided|contain|covered|available|include)|does not|doesn't|no (information|mention|reference)|unable to find|not found/i.test(
+    /(?:\b(?:not|no|never|none|nothing|without)\b|n['’]t\b)[^.!?]{0,40}?\b(?:specif\w*|mention\w*|provid\w*|contain\w*|cover\w*|availab\w*|includ\w*|list\w*|state\w*|discuss\w*|address\w*|found|find|information|reference|figure|data)\b|\b(?:unable to (?:find|locate)|not found|no such)\b/i.test(
       absent.answer,
     );
   assert(refuses, "declines rather than fabricating a figure");

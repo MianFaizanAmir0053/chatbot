@@ -3,6 +3,7 @@ import { ChatOpenAI } from "@langchain/openai";
 import { ChatCohere, CohereEmbeddings } from "@langchain/cohere";
 import type { BaseChatModel } from "@langchain/core/language_models/chat_models";
 import { Embeddings } from "@langchain/core/embeddings";
+import { AlibabaEmbeddings } from "./embeddings/alibaba";
 import {
   COHERE_API_KEYS,
   COHERE_MODELS,
@@ -18,6 +19,14 @@ import {
 } from "./config";
 
 import { credentialId, isRefused, noteFailure, usable } from "./credential-health";
+
+/**
+ * Endpoint identity for Cohere credentials.
+ *
+ * The health registry keys on endpoint plus key, and the Cohere client does not
+ * expose a base URL, so this names the one it uses.
+ */
+const COHERE_ENDPOINT = "https://api.cohere.com";
 
 export type ModelTier = "pro" | "fast";
 
@@ -150,6 +159,19 @@ export function primaryKeyCount(): number {
   return primaryKeyPool().length;
 }
 
+/**
+ * Extra body fields for a primary-provider call, or nothing.
+ *
+ * Spread rather than passed as an always-present `modelKwargs`, so an endpoint
+ * that has never heard of `enable_thinking` receives no such field at all. Only
+ * the FAST tier is touched — see `DEEPSEEK_FAST_THINKING` for the measurement
+ * behind that, including the grader that returned empty content.
+ */
+function primaryKwargs(tier: ModelTier): { modelKwargs?: Record<string, unknown> } {
+  if (tier !== "fast" || env.DEEPSEEK_FAST_THINKING === undefined) return {};
+  return { modelKwargs: { enable_thinking: env.DEEPSEEK_FAST_THINKING === "true" } };
+}
+
 export function getModel(tier: ModelTier = "pro", options: ModelOptions = {}): BaseChatModel {
   const temperature = options.temperature ?? (tier === "fast" ? 0 : 0.1);
 
@@ -160,6 +182,7 @@ export function getModel(tier: ModelTier = "pro", options: ModelOptions = {}): B
       apiKey,
       temperature,
       maxTokens: options.maxTokens,
+      ...primaryKwargs(tier),
       configuration: { baseURL: env.DEEPSEEK_BASE_URL },
     }) as unknown as BaseChatModel;
     return stamp(model, env.DEEPSEEK_BASE_URL, apiKey);
@@ -279,6 +302,7 @@ export function getAuxModels(tier: ModelTier = "fast", temperature = 0): BaseCha
           model: tier === "pro" ? MODEL_TIERS.PRO : MODEL_TIERS.FAST,
           apiKey: env.DEEPSEEK_API_KEY,
           temperature,
+          ...primaryKwargs(tier),
           configuration: { baseURL: env.DEEPSEEK_BASE_URL },
         }) as unknown as BaseChatModel,
         env.DEEPSEEK_BASE_URL,
@@ -436,18 +460,45 @@ class RotatingCohereEmbeddings extends Embeddings {
    */
   private readonly queryCache = new Map<string, number[]>();
 
+  /** Kept alongside the clients so a failure can be attributed to a credential. */
+  private readonly keys: string[];
+
   constructor(keys: string[]) {
     super({});
+    this.keys = keys;
     this.clients = keys.map(
       (apiKey) => new CohereEmbeddings({ apiKey, model: EMBEDDING_CONFIG.model }),
     );
   }
 
+  /**
+   * Indices worth trying, in order, starting from the last key that worked.
+   *
+   * Starting from the last success is not enough on its own. Retrieval issues
+   * its query variants concurrently, so several calls enter this loop before
+   * any of them has updated the cursor — and each one independently pays the
+   * dead key at the head. A live search with a trial key exhausted for the
+   * month logged "key 1/7 exhausted" three times for a single question, once
+   * per variant, every time.
+   *
+   * Consulting the shared health registry fixes that, because a refusal
+   * recorded by the first call is visible to the others immediately.
+   */
+  private order(): number[] {
+    const all = this.clients.map((_, i) => i);
+    const live = all.filter((i) => !isRefused(credentialId(COHERE_ENDPOINT, this.keys[i])));
+    // Never return nothing: if every key has been refused, trying them all is
+    // still better than failing without having asked.
+    const pool = live.length > 0 ? live : all;
+    const start = pool.indexOf(this.cursor);
+    const from = start >= 0 ? start : 0;
+    return [...pool.slice(from), ...pool.slice(0, from)];
+  }
+
   private async withFailover<T>(run: (client: CohereEmbeddings) => Promise<T>): Promise<T> {
     let lastError: unknown;
 
-    for (let attempt = 0; attempt < this.clients.length; attempt++) {
-      const index = (this.cursor + attempt) % this.clients.length;
+    for (const index of this.order()) {
       try {
         const result = await run(this.clients[index]);
         this.cursor = index;
@@ -455,6 +506,11 @@ class RotatingCohereEmbeddings extends Embeddings {
       } catch (error) {
         lastError = error;
         if (!isKeyExhausted(error)) throw error;
+        // A quota measured in days or months will not clear inside this
+        // process's usual lifetime, so the key leaves the pool rather than
+        // being re-tried by the next caller. A short rate limit is left alone:
+        // the rotation exists to ride those out.
+        noteFailure(credentialId(COHERE_ENDPOINT, this.keys[index]), error);
         console.warn(
           `[cohere] embeddings key ${index + 1}/${this.clients.length} exhausted, trying the next`,
         );
@@ -501,11 +557,45 @@ let embeddingsSingleton: Embeddings | null = null;
  * connection pool, and re-creating it per request wastes sockets under load.
  */
 export function getEmbeddings(): Embeddings {
+  if (embeddingsSingleton) return embeddingsSingleton;
+
+  if (env.EMBEDDING_PROVIDER === "alibaba") {
+    const keys = splitKeys(env.ALIBABA_API_KEY ?? env.DEEPSEEK_API_KEY);
+    if (keys.length === 0) {
+      throw new Error(
+        "EMBEDDING_PROVIDER=alibaba needs ALIBABA_API_KEY (or DEEPSEEK_API_KEY pointing at Model Studio).",
+      );
+    }
+    embeddingsSingleton = new AlibabaEmbeddings({
+      keys,
+      baseURL: env.ALIBABA_BASE_URL ?? env.DEEPSEEK_BASE_URL,
+      model: env.ALIBABA_EMBEDDING_MODEL,
+      // Same width as the Cohere default, so the two are at least
+      // *storable* in the same shape. They are still not interchangeable —
+      // see embeddingModelId and the vector store's guard.
+      dimensions: EMBEDDING_CONFIG.dimensions,
+    });
+    return embeddingsSingleton;
+  }
+
   if (COHERE_API_KEYS.length === 0) {
     throw new Error("COHERE_API_KEY is required for embeddings.");
   }
-  if (!embeddingsSingleton) {
-    embeddingsSingleton = new RotatingCohereEmbeddings(COHERE_API_KEYS);
-  }
+  embeddingsSingleton = new RotatingCohereEmbeddings(COHERE_API_KEYS);
   return embeddingsSingleton;
+}
+
+/**
+ * Which model produced the vectors this process writes and queries.
+ *
+ * Recorded on the collection so a provider switch cannot silently corrupt
+ * retrieval. Vectors from two embedding models are not comparable even at
+ * identical width — measured here at 0.019 similarity against a matching
+ * passage and 0.022 against an unrelated one, which is to say noise — and
+ * nothing in Qdrant, LangChain or this codebase would raise an error about it.
+ * Only an explicit stamp can catch it.
+ */
+export function embeddingModelId(): string {
+  const embedder = getEmbeddings() as { embeddingModelId?: string };
+  return embedder.embeddingModelId ?? `cohere:${EMBEDDING_CONFIG.model}:${EMBEDDING_CONFIG.dimensions}`;
 }

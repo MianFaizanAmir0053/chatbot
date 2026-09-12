@@ -12,6 +12,27 @@ const EnvSchema = z.object({
   // --- Reasoning models (DeepSeek V4) ---
   DEEPSEEK_API_KEY: z.string().optional(),
   DEEPSEEK_BASE_URL: z.string().default("https://api.deepseek.com"),
+  /**
+   * Whether the FAST tier is allowed a reasoning phase.
+   *
+   * Only meaningful on endpoints exposing the DashScope `enable_thinking`
+   * switch, and left unsent when unset so a provider that has never heard of
+   * the parameter is never handed it.
+   *
+   * Scoped to FAST because that is where a reasoning phase is actively
+   * harmful. A thinking model does not count its reasoning against `max_tokens`
+   * the way a caller expects: measured on Alibaba's MaaS endpoint,
+   * `deepseek-v4-pro` answering a one-word relevance grade at `max_tokens: 16`
+   * spent all sixteen on reasoning and returned *empty content* with
+   * `finish_reason: "length"`. A grader that returns nothing fails open, and
+   * every passage it was meant to filter goes through. On the same call
+   * `qwen3.5-plus` billed 312 output tokens against a 64-token cap. With the
+   * switch off both answer "yes" in one token, three to six times faster.
+   *
+   * PRO deliberately keeps its reasoning: that tier is the supervisor and the
+   * final synthesis, which is exactly what the extra tokens buy.
+   */
+  DEEPSEEK_FAST_THINKING: z.enum(["true", "false"]).optional(),
 
   // --- Fallback / auxiliary provider ---
   OPENAI_API_KEY: z.string().optional(),
@@ -26,6 +47,45 @@ const EnvSchema = z.object({
   OPENAI_BASE_URL: z.string().optional(),
 
   // --- Additional OpenAI-compatible gateways, chained for availability ---
+
+  /**
+   * Alibaba Model Studio, as a named entry in the chain.
+   *
+   * It already serves the primary slot through DEEPSEEK_BASE_URL, but that slot
+   * is reached by exactly one code path. The failover chain, the auxiliary
+   * chain and the subagent pool are all built from the *catalogue*, and an
+   * endpoint absent from it cannot appear in any of them: the strongest
+   * provider was serving only the supervisor's own calls while research
+   * branches and guardrails fell through to gateways with one live key between
+   * them.
+   *
+   * Defaults to the primary slot's values, so a deployment that has already
+   * pointed DEEPSEEK_* at Alibaba gains the chain entry without editing
+   * anything. Entries are deduplicated by endpoint and key, so pointing both at
+   * the same place yields one entry rather than two attempts at the same
+   * credential.
+   */
+  ALIBABA_API_KEY: z.string().optional(),
+  ALIBABA_BASE_URL: z.string().optional(),
+
+  /**
+   * Which provider embeds documents and queries.
+   *
+   * Not a rotation and not a failover — a choice, fixed for the life of a
+   * collection. Vectors from two embedding models are not comparable even at
+   * identical width: measured here, a question embedded by Alibaba scored 0.019
+   * against the passage that answers it and 0.022 against an unrelated one,
+   * while the same pair within one provider scored 0.60 and 0.12. Both emit
+   * 1536 floats, so mixing them raises no error — every search would just
+   * return whatever sat closest to nothing in particular.
+   *
+   * Changing this therefore requires re-indexing the corpus. The vector store
+   * records which model wrote a collection and refuses to query it with
+   * another, so the mistake is caught rather than suffered.
+   */
+  EMBEDDING_PROVIDER: z.enum(["cohere", "alibaba"]).default("cohere"),
+  ALIBABA_EMBEDDING_MODEL: z.string().default("text-embedding-v4"),
+
   GROQ_API_KEY: z.string().optional(),
   GROQ_BASE_URL: z.string().default("https://api.groq.com/openai/v1"),
 
@@ -223,6 +283,16 @@ export interface LlmProvider {
  * first, then latency. Override it with LLM_PROVIDER_ORDER.
  */
 const PROVIDER_CATALOGUE: LlmProvider[] = [
+  {
+    name: "alibaba",
+    // Falls back to the primary slot, which this deployment already points at
+    // Alibaba. Naming it here is what puts it in the failover, auxiliary and
+    // subagent chains as well as the primary one.
+    apiKey: env.ALIBABA_API_KEY ?? env.DEEPSEEK_API_KEY ?? "",
+    baseURL: env.ALIBABA_BASE_URL ?? env.DEEPSEEK_BASE_URL,
+    pro: process.env.ALIBABA_MODEL_PRO || MODEL_TIERS.PRO,
+    fast: process.env.ALIBABA_MODEL_FAST || MODEL_TIERS.FAST,
+  },
   {
     name: "groq",
     apiKey: env.GROQ_API_KEY ?? "",

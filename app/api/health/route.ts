@@ -20,6 +20,7 @@ import {
   subagentProviderNames,
 } from "@/lib/models";
 import { sparseIndexStats } from "@/lib/retrieval/hybrid";
+import { snapshotsAvailable } from "@/lib/snapshots/store";
 import { s3Healthy } from "@/lib/s3";
 import { getVectorStore } from "@/lib/vectorstore";
 
@@ -131,6 +132,15 @@ export async function GET() {
   checks.tools = {
     webSearch: activeSearchProvider(),
     tavilyConfigured: features.tavily,
+    /**
+     * Whether earlier captures of fetched pages are kept.
+     *
+     * Reported because its absence is silent and changes what the system can
+     * answer: with no archive, "what changed on this page?" has no evidence
+     * behind it, and the honest reply is that the page has not been read
+     * before.
+     */
+    pageArchive: (await snapshotsAvailable()) ? "available" : "unavailable (no MONGODB_URI)",
   };
 
   checks.guardrails = {

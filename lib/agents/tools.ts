@@ -5,6 +5,7 @@ import type { ThreadScope } from "../vectorstore";
 import { knowledgeBaseStatus } from "../ingest/pipeline";
 import { formatContext, retrieve } from "../retrieval/pipeline";
 import type { RankedDocument } from "../retrieval/rerank";
+import { saveSnapshot, snapshotHistory } from "../snapshots/store";
 import { webSearch } from "./websearch";
 
 /**
@@ -351,7 +352,25 @@ export function buildTools(collector: EvidenceCollector, options: ToolOptions = 
           // confirm a claim, not the whole page in every guardrail prompt.
           content: body.slice(0, 2000),
         });
-        return body || "Page contained no readable text.";
+
+        if (!body) return "Page contained no readable text.";
+
+        // Archived, and the model told at once if the page has moved on.
+        //
+        // Saying so here rather than waiting to be asked is what stops the
+        // guessing: a run told to compare a page with its previous version
+        // used to find nothing to compare against and invent the difference.
+        // Now the fetch itself reports whether there is a "before", so the
+        // model either has one or knows it does not.
+        const { previous, changed } = await saveSnapshot(parsed.toString(), parsed.hostname, body);
+        if (changed && previous) {
+          return (
+            `${body}\n\n---\n[archive] This page was last captured on ${previous.fetchedAt} ` +
+            `and has changed since. Call \`page_history\` with this URL to read that version ` +
+            `and compare. Do not describe the earlier version without reading it.`
+          );
+        }
+        return body;
       } catch (error) {
         return `Fetch failed: ${error instanceof Error ? error.message : String(error)}`;
       }
@@ -362,6 +381,65 @@ export function buildTools(collector: EvidenceCollector, options: ToolOptions = 
         "Fetch and extract the readable text of a public web page. Use after web_search when a " +
         "result looks promising but its snippet is too short to answer the question.",
       schema: z.object({ url: z.string().describe("Absolute http(s) URL to fetch") }),
+    },
+  );
+
+  /**
+   * Earlier captures of a page this system has read before.
+   *
+   * The tool that makes "what changed?" answerable instead of guessable. Asked
+   * to compare a page against its previous version, a run had nothing to
+   * compare with — the result cache is per-request — and wrote the comparison
+   * anyway, inventing the earlier version. Returning the actual stored text
+   * means the model either reads the old version or is told plainly that there
+   * is none.
+   */
+  const pageHistory = tool(
+    guarded("page_history", async ({ url, version }: { url: string; version?: number }) => {
+      const history = await snapshotHistory(url);
+      if (history.length === 0) {
+        return (
+          `No earlier capture of ${url} exists. This page has not been read before, so there ` +
+          `is nothing to compare it against. Say that plainly rather than describing a ` +
+          `previous version you have not seen.`
+        );
+      }
+
+      const index = Math.max(1, version ?? 1);
+      const wanted = history[index];
+      if (!wanted) {
+        return (
+          `${history.length} capture(s) of ${url}: ` +
+          `${history.map((s, i) => `${i === 0 ? "current" : `#${i}`} ${s.fetchedAt}`).join(", ")}. ` +
+          `There is no capture #${index}.`
+        );
+      }
+
+      collector.webResults.push({
+        title: `${wanted.title} (captured ${wanted.fetchedAt})`,
+        url: wanted.url,
+        content: wanted.text.slice(0, 2000),
+      });
+
+      return (
+        `Capture #${index} of ${url}, read on ${wanted.fetchedAt} ` +
+        `(${history.length} capture(s) held, newest ${history[0].fetchedAt}):\n\n${wanted.text}`
+      );
+    }),
+    {
+      name: "page_history",
+      description:
+        "Read an earlier capture of a web page this system has fetched before. Use whenever a " +
+        "question asks what changed, what a page used to say, or to compare versions. Version 1 " +
+        "is the capture before the current one, 2 the one before that. If no earlier capture " +
+        "exists this says so — report that rather than describing a version you have not read.",
+      schema: z.object({
+        url: z.string().describe("The page's URL, as fetched"),
+        version: z
+          .number()
+          .optional()
+          .describe("How far back: 1 is the previous capture (the default), 2 the one before it"),
+      }),
     },
   );
 
@@ -399,8 +477,10 @@ export function buildTools(collector: EvidenceCollector, options: ToolOptions = 
   // reach a document.
   if (options.delegating) return [listDocuments, calculator];
 
+  //  travels with the web tools because it only ever has
+  // anything to show for a page  has read.
   return allowWeb
-    ? [searchDocuments, listDocuments, searchWeb, fetchUrl, calculator]
+    ? [searchDocuments, listDocuments, searchWeb, fetchUrl, pageHistory, calculator]
     : [searchDocuments, listDocuments, calculator];
 }
 

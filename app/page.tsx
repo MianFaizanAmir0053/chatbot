@@ -94,6 +94,7 @@ const TOOL_LABELS: Record<string, string> = {
   list_documents: "Listing documents",
   web_search: "Searching the web",
   fetch_url: "Reading a web page",
+  page_history: "Reading an earlier capture",
   calculator: "Calculating",
   write_todos: "Planning",
 };

@@ -25,7 +25,12 @@
  * Usage: npx tsx --env-file=.env scripts/trace-audit-test.ts
  */
 
-import { checkGroundedness, stripLeakedAuxJson, validateCitations } from "../lib/guardrails/output";
+import {
+  checkGroundedness,
+  looksLikeInfrastructureExcuse,
+  stripLeakedAuxJson,
+  validateCitations,
+} from "../lib/guardrails/output";
 import type { RankedDocument } from "../lib/retrieval/rerank";
 
 let failures = 0;
@@ -128,8 +133,91 @@ function citationGap() {
   );
 }
 
+/**
+ * The retry middleware's failure text, exactly as it formats it.
+ *
+ * `Model call failed after ${n} ${n === 1 ? "attempt" : "attempts"} with ...`
+ * — reproduced here so a wording change upstream shows up as a failing check
+ * rather than as a branch that reports success while returning an error.
+ */
+function retryFailureText(attempts: number): string {
+  return (
+    `Model call failed after ${attempts} ${attempts === 1 ? "attempt" : "attempts"} ` +
+    `with MiddlewareError: 403 Free quota exhausted.`
+  );
+}
+
+/** The guard both the delegation tool and the route apply to that text. */
+const EXHAUSTED = /^Model call failed after \d+ attempts?\b/i;
+
+function retryFailureDetection() {
+  banner("3. A branch that returns the provider's error instead of a finding");
+
+  // `modelRetryMiddleware` runs with onFailure "continue", so a branch that
+  // never reached a model resolves *successfully* carrying this text. Unless it
+  // is recognised, the supervisor reads a provider error as research.
+  check(
+    "the four-attempt wording is caught",
+    EXHAUSTED.test(retryFailureText(4)),
+    "the case the guard was written for",
+  );
+  // The regression. Making an unretryable error fail immediately changed the
+  // count to 1 and the noun to the singular, and a pattern matching only
+  // "attempts" stopped matching — silently, since the branch still resolved.
+  check(
+    "and so is the single-attempt wording",
+    EXHAUSTED.test(retryFailureText(1)),
+    "the one that slipped through",
+  );
+  check("as is two", EXHAUSTED.test(retryFailureText(2)));
+
+  // It must stay anchored: an answer that merely discusses failures is not one.
+  check(
+    "an answer describing a failure is not caught",
+    !EXHAUSTED.test("The retry logic reports that a model call failed after 3 attempts [1]."),
+    "anchored to the start",
+  );
+  check("nor an ordinary answer", !EXHAUSTED.test("The oil capacity is 3.4 litres [1]."));
+}
+
+function excuses() {
+  banner("4. An answer that blames the system while holding the evidence");
+
+  // Verbatim from a live delegated turn whose branches all returned ok, with
+  // no provider error anywhere in the run.
+  for (const excuse of [
+    "I encountered rate limit issues while trying to research your questions about engine oil " +
+      "capacity. Unfortunately, I cannot retrieve this information at this time.",
+    "I encountered rate limits and quota issues while trying to research the documents. This " +
+      "prevents me from completing the comparison.",
+    "Unable to complete the research due to API rate limiting.",
+  ]) {
+    check(
+      `flagged: ${JSON.stringify(excuse.slice(0, 46))}`,
+      looksLikeInfrastructureExcuse(excuse),
+    );
+  }
+
+  // The important half. An answer may legitimately be *about* rate limits —
+  // that is a normal thing for a technical document to cover — and flagging it
+  // would put a warning on a perfectly good answer.
+  for (const fine of [
+    "The API enforces a rate limit of 200 requests per day [1]. Exceeding it returns HTTP 429 [2].",
+    "The documents describe a quota of 1000 calls per month for trial accounts [1].",
+    "The engine oil capacity is 3.4 litres including the filter [1].",
+    "The documents do not cover valve clearance intervals. I searched for the term and for " +
+      "'tappet' and neither appears.",
+    "Rate limiting is implemented with a token bucket, and the quota resets at midnight UTC [3].",
+  ]) {
+    check(
+      `not flagged: ${JSON.stringify(fine.slice(0, 46))}`,
+      !looksLikeInfrastructureExcuse(fine),
+    );
+  }
+}
+
 function leakedJson() {
-  banner("3. Planner output stored inside an answer");
+  banner("5. Planner output stored inside an answer");
 
   // Verbatim from the trace.
   const one =
@@ -154,7 +242,7 @@ function leakedJson() {
     stripLeakedAuxJson('{"groundedness":0.9,"unsupportedClaims":[]}The answer.') === "The answer.",
   );
 
-  banner("4. And an answer that legitimately starts with JSON is left alone");
+  banner("6. And an answer that legitimately starts with JSON is left alone");
 
   for (const intact of [
     '{"name":"chatbot","version":"1.0"} is the package manifest.',
@@ -174,6 +262,8 @@ function leakedJson() {
 async function main() {
   await groundednessGap();
   citationGap();
+  retryFailureDetection();
+  excuses();
   leakedJson();
 
   banner("Summary");

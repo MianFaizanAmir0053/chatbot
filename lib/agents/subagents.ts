@@ -512,7 +512,18 @@ export function buildDelegationTool(
       // Labelling it a failure keeps the distinction the whole design rests on
       // — between the documents being silent and the infrastructure being
       // unavailable — which the supervisor cannot otherwise tell apart.
-      if (/^Model call failed after \d+ attempts/.test(text.trim())) {
+      // Singular as well as plural, which is not a detail.
+      //
+      // `formatFailureMessage` writes "1 attempt" and "N attempts", and this
+      // pattern originally matched only the plural — correct while every
+      // failure was retried four times first. Making an unretryable error fail
+      // immediately changed `attemptsMade` to 1, and with it the wording, so
+      // the guard silently stopped matching: the branch was logged `ok`, its
+      // "finding" was the provider's error text, and the supervisor read that
+      // and told the user it had encountered rate limits while holding perfectly
+      // good findings from its other branches. Every log line said the run was
+      // healthy.
+      if (/^Model call failed after \d+ attempts?\b/i.test(text.trim())) {
         done("EXHAUSTED");
         // The provider's own words, not just the fact of exhaustion. Without
         // them a branch failure is indistinguishable from any other, and the
@@ -682,7 +693,36 @@ export function buildDelegationTool(
 
       findingsDelivered += findings.length;
 
+      // Lead with what happened to the branches, in plain terms.
+      //
+      // The header used to say only "3 finding(s)", which leaves whether the
+      // research actually succeeded for the supervisor to infer — and after a
+      // long wait it sometimes inferred wrongly. Measured: every branch
+      // returned `ok`, no provider error was logged anywhere in the run, and
+      // the supervisor still opened with "I encountered rate limit issues while
+      // trying to research your questions" and declined to answer, while
+      // holding the findings that answered them.
+      //
+      // Stated as fact rather than as an instruction not to make excuses.
+      // Telling a model what not to say is weaker than removing the ambiguity
+      // it was resolving, and the tool is the only thing here that knows how
+      // the branches ended.
+      const failed = findings.filter((f) => f.includes("\nFAILED — ")).length;
+      const partial = findings.filter((f) => f.includes("(PARTIAL — this researcher")).length;
+      const complete = findings.length - failed - partial;
+
+      const status =
+        failed === 0 && partial === 0
+          ? `All ${findings.length} research branch(es) completed successfully. No provider, ` +
+            `quota or rate-limit failure occurred on this turn. The evidence below is the ` +
+            `complete result of the research you asked for — answer from it.`
+          : `${complete} of ${findings.length} branch(es) completed in full` +
+            `${partial > 0 ? `, ${partial} partially` : ""}` +
+            `${failed > 0 ? `, ${failed} could not be researched` : ""}. ` +
+            `Answer from what returned, and say which parts could not be checked.`;
+
       return (
+        `${status}\n\n` +
         `${findings.length} finding(s)${substantial ? " and an adversarial check" : ""}:\n\n` +
         sections.join("\n\n---\n\n")
       );

@@ -68,6 +68,32 @@ function sseStream(run: (emit: Emit, signal: AbortSignal) => Promise<void>): Res
         }
       };
 
+      /**
+       * A comment line every 20 seconds, so the connection is never idle.
+       *
+       * A turn has genuinely quiet stretches — the supervisor synthesising
+       * after its researchers return can run for minutes with nothing to
+       * report — and an idle connection is what intermediaries time out. It is
+       * not hypothetical: a client with the default 300-second body timeout cut
+       * a delegated turn off mid-synthesis, and a proxy would have done the same
+       * without the courtesy of an error.
+       *
+       * A comment rather than an event: SSE ignores lines beginning with a
+       * colon, so this keeps the socket warm without the client needing to know
+       * it exists.
+       */
+      const heartbeat = setInterval(() => {
+        if (closed) return;
+        try {
+          controller.enqueue(encoder.encode(`: keepalive\n\n`));
+        } catch {
+          closed = true;
+        }
+      }, 20_000);
+      // Node keeps the process alive for a pending timer, and this one outlives
+      // nothing useful.
+      heartbeat.unref?.();
+
       try {
         await run(emit, controllerRef.signal);
       } catch (error) {
@@ -75,6 +101,7 @@ function sseStream(run: (emit: Emit, signal: AbortSignal) => Promise<void>): Res
         console.error("[chat] stream failed:", error);
         emit("error", { message });
       } finally {
+        clearInterval(heartbeat);
         emit("done", {});
         closed = true;
         try {
@@ -488,7 +515,10 @@ export async function POST(req: NextRequest) {
     // When every provider refuses, the retry middleware reports the exhaustion
     // as ordinary message content. Returning that as an answer — or returning
     // nothing at all — hides an outage behind a blank reply, so raise it.
-    if (!answer.trim() || /^Model call failed after \d+ attempts/.test(answer)) {
+    // Singular as well as plural: the retry middleware writes "1 attempt" when
+    // an error is not worth retrying, and matching only "attempts" let that
+    // message through as though it were an answer.
+    if (!answer.trim() || /^Model call failed after \d+ attempts?\b/i.test(answer)) {
       const detail = answer.trim()
         ? answer.replace(/\s+/g, " ").slice(0, 300)
         : "The model returned no output.";
@@ -522,6 +552,7 @@ export async function POST(req: NextRequest) {
             "an answer from the same evidence."
           : "Every configured model provider refused the request — most often a rate limit " +
             `or an exhausted balance. Details: ${detail}`;
+
 
       emit("error", { message: failure });
 

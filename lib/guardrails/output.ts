@@ -251,6 +251,32 @@ export function stripLeakedAuxJson(text: string): string {
 }
 
 /**
+ * An answer that blames infrastructure rather than answering.
+ *
+ * "I encountered rate limits while trying to research your question", and its
+ * relatives. Sometimes true and worth saying — but measured on a live run,
+ * every research branch returned successfully, no provider error appeared
+ * anywhere in the logs, and the supervisor wrote this anyway while holding the
+ * findings that answered the question.
+ *
+ * Matched on the shape of an excuse about *reaching* sources, not on the words
+ * alone: an answer may legitimately mention that a document discusses rate
+ * limits, and must not be flagged for it.
+ */
+const INFRASTRUCTURE_EXCUSE =
+  /\b(rate[- ]limit\w*|quota|429|throttl\w*|api (?:error|failure)|provider (?:error|refused))\b[\s\S]{0,120}?\b(unable|cannot|could not|couldn'?t|prevent\w*|unfortunately|not (?:able|possible)|failed) ?\b|\b(unable|cannot|could not|couldn'?t|prevent\w*|failed) ?\b[\s\S]{0,120}?\b(rate[- ]limit\w*|quota|429|throttl\w*)\b/i;
+
+/**
+ * True when an answer excuses itself with an infrastructure failure.
+ *
+ * Only meaningful alongside what the run actually gathered — the caller decides
+ * whether the excuse is justified. On its own this says nothing about truth.
+ */
+export function looksLikeInfrastructureExcuse(answer: string): boolean {
+  return INFRASTRUCTURE_EXCUSE.test(answer);
+}
+
+/**
  * Tool-call markup that arrived as prose instead of as a tool call.
  *
  * Not every model emits calls in the wire format its gateway parses. Several

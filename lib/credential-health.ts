@@ -67,7 +67,7 @@ function statusOf(error: unknown): number | undefined {
  * must never take a working key out of the pool.
  */
 const ACCOUNT_REFUSED =
-  /\b(restricted|suspended|deactivated|disabled|banned|revoked|terminated|invalid api key|invalid_api_key|incorrect api key|no longer active)\b/i;
+  /\b(restricted|suspended|deactivated|disabled|banned|revoked|terminated|invalid api key|invalid_api_key|incorrect api key|no longer active|insufficient balance|insufficient funds|insufficient credit|payment required|billing)\b/i;
 
 /**
  * True when retrying this error with this credential cannot succeed.
@@ -93,7 +93,16 @@ const DAILY_LIMIT = /\b(daily|per[- ]day|\/day|a day)\b/i;
 export function isPermanentRefusal(error: unknown): boolean {
   const status = statusOf(error);
   if (status === 401 || status === 403) return true;
+  // 402 is the least ambiguous refusal there is: the credential is valid and
+  // the account cannot pay. No retry within a request can change that, and no
+  // backoff is short enough to outlast it. A live DeepSeek key returned 402
+  // "Insufficient Balance" on every call while authenticating perfectly and
+  // listing its models — so nothing short of the status distinguishes it from
+  // a working key until the completion is attempted.
+  if (status === 402) return true;
   const message = String((error as { message?: unknown })?.message ?? "");
+  // Some gateways report the same condition as a 400 with the reason in the
+  // text rather than in the status.
   if (status === 400) return ACCOUNT_REFUSED.test(message);
   // A daily ceiling will not clear inside a request. Retrying it four times
   // across thirty seconds of backoff was observed costing a research branch

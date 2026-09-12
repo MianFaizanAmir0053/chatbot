@@ -76,6 +76,23 @@ function classification() {
     isPermanentRefusal(apiError(429, "Rate limit: 200 requests per day exceeded")),
   );
 
+  // An exhausted balance. The clearest refusal there is: the credential is
+  // valid, authenticates, and lists its models — only a completion reveals it.
+  check(
+    "an exhausted balance is permanent",
+    isPermanentRefusal(apiError(402, "Insufficient Balance")),
+    "402, observed on a live DeepSeek key",
+  );
+  check(
+    "and so is the same thing reported as a 400",
+    isPermanentRefusal(apiError(400, "Insufficient Balance")),
+    "gateways differ on the status",
+  );
+  check(
+    "as is a billing message",
+    isPermanentRefusal(apiError(400, "Your account has a billing problem")),
+  );
+
   check("a plain rate limit is not", !isPermanentRefusal(apiError(429, "Rate limit reached")), "429");
   // Deliberately not matched: several gateways send this for a per-minute
   // window that clears in seconds, and the backoff is there to wait it out.

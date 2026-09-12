@@ -103,8 +103,28 @@ function citationGap() {
   const zero = validateCitations("The site lists three projects [0].", docs);
   check(
     "a [0] marker is caught as invalid",
-    !zero.valid && zero.invalidRefs.includes(0),
+    !zero.valid && zero.invalidRefs.includes("0"),
     "ordinals are 1-based",
+  );
+
+  // Web markers were previously invisible to the validator, so a fabricated one
+  // passed untouched — the namespace least deserving of trust was the only one
+  // taken on trust.
+  const web = validateCitations("According to the site [W1], and also [W7].", docs, 3);
+  check(
+    "a web marker beyond what was retrieved is caught",
+    !web.valid && web.invalidRefs.includes("W7") && !web.invalidRefs.includes("W1"),
+    `invalid: ${web.invalidRefs.join(", ") || "none"}`,
+  );
+  check(
+    "and a web-cited answer counts as cited",
+    validateCitations("Per the site [W1].", [], 2).refs.length === 1,
+    "web citations are citations",
+  );
+  check(
+    "with no web sources retrieved, any [Wn] is invalid",
+    !validateCitations("Per the site [W1].", docs, 0).valid,
+    "nothing was fetched",
   );
 }
 

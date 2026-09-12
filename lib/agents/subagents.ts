@@ -216,11 +216,21 @@ type ResearcherName = (typeof RESEARCHERS)[number];
 export function batchQualifiesForVerification(
   tasks: Array<{ researcher?: string }>,
 ): boolean {
-  return (
-    SUBAGENT_CONFIG.AUTO_VERIFY &&
-    tasks.length >= SUBAGENT_CONFIG.AUTO_VERIFY_MIN_FINDINGS &&
-    !tasks.some((t) => t.researcher === "verifier")
-  );
+  if (!SUBAGENT_CONFIG.AUTO_VERIFY) return false;
+  // Verifying a verifier is circular.
+  if (tasks.some((t) => t.researcher === "verifier")) return false;
+  if (tasks.length >= SUBAGENT_CONFIG.AUTO_VERIFY_MIN_FINDINGS) return true;
+
+  // A lone web branch is the exception to the "one finding is a gap-filling
+  // lookup" rule, and it earns the extra branch.
+  //
+  // A passage came from a file the user uploaded and can be shown to them; a
+  // web finding is whatever a model chose to read, and when it is the turn's
+  // only evidence the whole answer rests on it with nothing to cross-check it
+  // against. A measured turn asked for an audit comparing two versions of a
+  // page, retrieved one of them, and wrote a scored comparison of both — on a
+  // single web branch that nothing attacked.
+  return tasks.some((t) => t.researcher === "web-researcher");
 }
 
 /**

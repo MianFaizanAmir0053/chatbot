@@ -363,17 +363,51 @@ export function normaliseCitations(answer: string): string {
  * actually retrieved. Catches fabricated citation numbers, which read as
  * authoritative but reference nothing.
  */
+/** Every citation marker in an answer, in both namespaces. */
+const ANY_CITATION = /\[(W?)(\d+)\]/gi;
+
+export interface CitationReport {
+  valid: boolean;
+  /** Unresolvable markers, as written — "3", "W7". */
+  invalidRefs: string[];
+  /** Every marker found, as written. Empty means the answer cited nothing. */
+  refs: string[];
+}
+
+/**
+ * Check that every citation marker resolves to something that was retrieved.
+ *
+ * Both namespaces are checked. `[n]` is a passage and `[Wn]` a web source, and
+ * for a long time only the first was validated — web markers were not merely
+ * unchecked but invisible to the validator, so an answer citing `[W7]` when
+ * three results had been retrieved passed cleanly. That is the wrong way round:
+ * a passage came from a file the user uploaded, while a web source is whatever
+ * a model chose to read, so if either namespace deserved to be taken on trust
+ * it was not that one.
+ */
 export function validateCitations(
   answer: string,
   documents: RankedDocument[],
-): { valid: boolean; invalidRefs: number[]; refs: number[] } {
-  const refs = [...answer.matchAll(/\[(\d+)\]/g)].map((m) => Number(m[1]));
-  const invalidRefs = [...new Set(refs.filter((n) => n < 1 || n > documents.length))];
+  webSources = 0,
+): CitationReport {
+  const refs: string[] = [];
+  const invalid: string[] = [];
+
+  ANY_CITATION.lastIndex = 0;
+  for (let m = ANY_CITATION.exec(answer); m; m = ANY_CITATION.exec(answer)) {
+    const isWeb = m[1].toLowerCase() === "w";
+    const n = Number(m[2]);
+    const marker = isWeb ? `W${n}` : String(n);
+    refs.push(marker);
+    const limit = isWeb ? webSources : documents.length;
+    if (n < 1 || n > limit) invalid.push(marker);
+  }
+
   // `refs` is returned as well as the verdict, because "no invalid citations"
   // and "cited its sources" are different claims and only the first is checked
   // here. An answer with no markers at all is trivially valid, and the caller
   // needs to be able to tell that apart from one that cited correctly.
-  return { valid: invalidRefs.length === 0, invalidRefs, refs };
+  return { valid: invalid.length === 0, invalidRefs: [...new Set(invalid)], refs };
 }
 
 /**
@@ -389,11 +423,16 @@ export function validateCitations(
  * like "close the space before a comma" is a reasonable thing to do to damage
  * this function caused but not to prose a model deliberately wrote.
  */
-export function stripInvalidCitations(answer: string, documents: RankedDocument[]): string {
+export function stripInvalidCitations(
+  answer: string,
+  documents: RankedDocument[],
+  webSources = 0,
+): string {
   let removed = 0;
-  const stripped = answer.replace(/\[(\d+)\]/g, (match, n) => {
+  const stripped = answer.replace(/\[(W?)(\d+)\]/gi, (match, w: string, n: string) => {
+    const limit = w.toLowerCase() === "w" ? webSources : documents.length;
     const idx = Number(n);
-    if (idx >= 1 && idx <= documents.length) return match;
+    if (idx >= 1 && idx <= limit) return match;
     removed++;
     return "";
   });

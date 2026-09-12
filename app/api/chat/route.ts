@@ -11,6 +11,7 @@ import {
 import { appendMessages, getConversation, scopeChainFor } from "@/lib/conversations/store";
 import { batchQualifiesForVerification } from "@/lib/agents/subagents";
 import { hasReasoningProvider } from "@/lib/config";
+import { refusedCredentials } from "@/lib/credential-health";
 import { ChatRequestSchema, guardInput } from "@/lib/guardrails/input";
 import {
   checkGroundedness,
@@ -34,6 +35,24 @@ export const maxDuration = 300;
  * the referential weight ("it", "the second one") that replay exists to serve.
  */
 const MAX_REPLAYED_TURNS = 12;
+
+/**
+ * One structured line per turn, for finding the failures that do not throw.
+ *
+ * Every defect worth fixing in this route has been silent: an answer that read
+ * perfectly while citing nothing, a groundedness score of 1 awarded because the
+ * judge was handed no evidence, a planner's JSON spliced into the reply, a
+ * delegation that fanned out to nothing. None produced an error, and each was
+ * found either by reading a trace after the fact or by a test written once the
+ * damage was already understood.
+ *
+ * A line per turn makes that class visible without either. It is JSON on one
+ * line so a log search can filter on it — `grep '"cited":0'` finds every
+ * uncited answer, `'"grounded":-1'` every turn nothing could verify.
+ */
+function logTurn(fields: Record<string, unknown>) {
+  console.log(`[turn] ${JSON.stringify(fields)}`);
+}
 
 /* ------------------------------------------------------------------ *
  * SSE helpers
@@ -125,6 +144,7 @@ export async function POST(req: NextRequest) {
   const thread = threadId || randomUUID();
 
   return sseStream(async (emit, signal) => {
+    const startedAt = Date.now();
     emit("thread", { threadId: thread });
 
     /* --- Input guardrails, before any spend --- */
@@ -139,6 +159,7 @@ export async function POST(req: NextRequest) {
         { role: "user", content: message, createdAt: at },
         { role: "assistant", content: verdict.reason ?? "Blocked", blocked: true, createdAt: at },
       ]);
+      logTurn({ thread, ms: Date.now() - startedAt, outcome: "blocked", signals: verdict.signals });
       return;
     }
     if (verdict.signals.length > 0) {
@@ -552,6 +573,18 @@ export async function POST(req: NextRequest) {
           createdAt: new Date().toISOString(),
         },
       ]);
+
+      logTurn({
+        thread,
+        ms: Date.now() - startedAt,
+        outcome: "no-answer",
+        mode: deepAgents ? "delegated" : thinking,
+        passages: collector.documents.length,
+        webSources: collector.webResults.length,
+        searches: collector.searches.length,
+        unexecutedToolCall,
+        refusedCredentials: refusedCredentials().length,
+      });
       return;
     }
 
@@ -568,10 +601,10 @@ export async function POST(req: NextRequest) {
       emit("revised_answer", { text: answer });
     }
 
-    const citations = validateCitations(answer, collector.documents);
+    const citations = validateCitations(answer, collector.documents, collector.webResults.length);
     if (!citations.valid) {
       console.warn(`[chat] invalid citation refs: ${citations.invalidRefs.join(", ")}`);
-      const cleaned = stripInvalidCitations(answer, collector.documents);
+      const cleaned = stripInvalidCitations(answer, collector.documents, collector.webResults.length);
       emit("revised_answer", { text: cleaned });
       answer = cleaned;
     }
@@ -650,5 +683,22 @@ export async function POST(req: NextRequest) {
         createdAt: new Date().toISOString(),
       },
     ]);
+
+    logTurn({
+      thread,
+      ms: Date.now() - startedAt,
+      mode: deepAgents ? "delegated" : thinking,
+      web: webSearch,
+      chars: answer.length,
+      passages: collector.documents.length,
+      webSources: collector.webResults.length,
+      searches: collector.searches.length,
+      cited: citations.refs.length,
+      invalidCited: citations.invalidRefs.length,
+      grounded: grounded.score,
+      verdict: grounded.verdict,
+      unexecutedToolCall,
+      refusedCredentials: refusedCredentials().length,
+    });
   });
 }

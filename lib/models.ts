@@ -11,6 +11,7 @@ import {
   FALLBACK_MODELS,
   LLM_PROVIDERS,
   MODEL_TIERS,
+  PRIMARY_PROVIDERS,
   SUBAGENT_PROVIDERS,
   splitKeys,
   type LlmProvider,
@@ -102,61 +103,87 @@ function openAIModel(tier: ModelTier, temperature: number, maxTokens?: number): 
  * one is active.
  */
 /**
- * Round-robin cursor over the leading provider's keys.
+ * Round-robin cursor over the primary pool.
  *
- * Deliberately rotates keys and not models. Free tiers meter per key, so
- * spreading calls across eight keys multiplies the daily ceiling eightfold and
- * leaves each key's short-term rate limit largely untouched. Because the
- * endpoint and model never change, every request is served by exactly the same
- * model — rotation costs nothing in answer quality.
+ * Deliberately rotates credentials and not models. Free tiers meter per key and
+ * per account, so spreading calls across every configured credential multiplies
+ * the daily ceiling and leaves each one's short-term rate limit largely
+ * untouched.
  *
  * Rotating across *models* was tried and reverted: models differ in whether
  * they can drive the agent loop at all, so it made quality a coin flip per
- * request. Model choice stays fixed and ordered by measured competence; only
- * the credential moves.
+ * request. Which is why widening the pool to a second endpoint is gated behind
+ * PRIMARY_PROVIDER_ORDER — an entry joins the main path only when its tier
+ * models are ones you would accept on any request.
  */
 let keyCursor = 0;
-let lastPrimaryKey = "";
+let lastPrimaryId = "";
 
 /**
- * Every key configured against the endpoint serving the primary model.
+ * The synthetic entry used when nothing in the registry matches.
  *
- * Refused keys are dropped. This is the pool that matters most: it feeds the
- * agent's own model, and a rotation that keeps dealing out refused credentials
- * puts one at the front of most requests — where each costs a full retry
- * sequence before any fallback is reached.
+ * The registry is built from the catalogue, and a deployment can configure
+ * DEEPSEEK_* without the endpoint appearing under any catalogue name. Rather
+ * than return an empty pool — which would drop the primary entirely — describe
+ * the configured slot directly.
  */
-function primaryKeyPool(): string[] {
-  const pool = LLM_PROVIDERS.filter((p) => p.baseURL === env.DEEPSEEK_BASE_URL).map(
-    (p) => p.apiKey,
-  );
-  const configured = pool.length > 0 ? pool : splitKeys(env.DEEPSEEK_API_KEY);
-  return usable(configured, (key) => credentialId(env.DEEPSEEK_BASE_URL, key));
-}
-
-/** How many primary keys are configured, refused or not. Reported by /api/health. */
-export function primaryKeysConfigured(): number {
-  const pool = LLM_PROVIDERS.filter((p) => p.baseURL === env.DEEPSEEK_BASE_URL);
-  return pool.length > 0 ? pool.length : splitKeys(env.DEEPSEEK_API_KEY).length;
+function deepseekSlot(): LlmProvider[] {
+  return splitKeys(env.DEEPSEEK_API_KEY).map((apiKey) => ({
+    name: "deepseek",
+    apiKey,
+    baseURL: env.DEEPSEEK_BASE_URL,
+    pro: MODEL_TIERS.PRO,
+    fast: MODEL_TIERS.FAST,
+  }));
 }
 
 /**
- * The key for this call, advancing the rotation.
+ * Every credential the primary rotation may deal, minus refused ones.
+ *
+ * This is the pool that matters most: it feeds the agent's own model, and a
+ * rotation that keeps dealing out refused credentials puts one at the front of
+ * most requests — where each costs a full retry sequence before any fallback is
+ * reached.
+ *
+ * Entries carry their own endpoint and model ids, so two accounts on separate
+ * workspace endpoints rotate as peers. A workspace key is only valid against
+ * the workspace that issued it, so sharing one base URL across both would 403
+ * every other call.
+ */
+function primaryPool(): LlmProvider[] {
+  const configured = PRIMARY_PROVIDERS.length > 0 ? PRIMARY_PROVIDERS : deepseekSlot();
+  return usable(configured, (p) => credentialId(p.baseURL, p.apiKey));
+}
+
+/** How many primary credentials are configured, refused or not. Reported by /api/health. */
+export function primaryKeysConfigured(): number {
+  return PRIMARY_PROVIDERS.length > 0 ? PRIMARY_PROVIDERS.length : deepseekSlot().length;
+}
+
+/**
+ * The credential for this call, advancing the rotation.
  *
  * Advances per model call rather than per request, so the several calls one
- * agent turn makes are themselves spread across keys instead of concentrating
- * a whole run's burst on one.
+ * agent turn makes are themselves spread across credentials instead of
+ * concentrating a whole run's burst on one.
  */
-function nextPrimaryKey(): string {
-  const pool = primaryKeyPool();
-  if (pool.length === 0) return env.DEEPSEEK_API_KEY ?? "";
-  lastPrimaryKey = pool[keyCursor++ % pool.length];
-  return lastPrimaryKey;
+function nextPrimaryProvider(): LlmProvider {
+  const pool = primaryPool();
+  const provider = pool.length > 0 ? pool[keyCursor++ % pool.length] : deepseekSlot()[0];
+  const resolved = provider ?? {
+    name: "deepseek",
+    apiKey: env.DEEPSEEK_API_KEY ?? "",
+    baseURL: env.DEEPSEEK_BASE_URL,
+    pro: MODEL_TIERS.PRO,
+    fast: MODEL_TIERS.FAST,
+  };
+  lastPrimaryId = credentialId(resolved.baseURL, resolved.apiKey);
+  return resolved;
 }
 
-/** How many keys currently back the primary provider. Reported by /api/health. */
+/** How many credentials currently back the primary provider. Reported by /api/health. */
 export function primaryKeyCount(): number {
-  return primaryKeyPool().length;
+  return primaryPool().length;
 }
 
 /**
@@ -176,16 +203,16 @@ export function getModel(tier: ModelTier = "pro", options: ModelOptions = {}): B
   const temperature = options.temperature ?? (tier === "fast" ? 0 : 0.1);
 
   if (features.deepseek) {
-    const apiKey = nextPrimaryKey();
+    const provider = nextPrimaryProvider();
     const model = new ChatDeepSeek({
-      model: tier === "pro" ? MODEL_TIERS.PRO : MODEL_TIERS.FAST,
-      apiKey,
+      model: tier === "pro" ? provider.pro : provider.fast,
+      apiKey: provider.apiKey,
       temperature,
       maxTokens: options.maxTokens,
       ...primaryKwargs(tier),
-      configuration: { baseURL: env.DEEPSEEK_BASE_URL },
+      configuration: { baseURL: provider.baseURL },
     }) as unknown as BaseChatModel;
-    return stamp(model, env.DEEPSEEK_BASE_URL, apiKey);
+    return stamp(model, provider.baseURL, provider.apiKey);
   }
 
   if (features.openai) {
@@ -367,10 +394,11 @@ export function providerModel(
  * deliberately excluded — see ModelOptions.allowCohere.
  */
 export function getFallbackModels(tier: ModelTier = "pro"): BaseChatModel[] {
-  // Exclude the key the rotation just handed out, not a fixed one. With keys
-  // rotating, a hardcoded exclusion would drop a healthy key from the chain
-  // while leaving in the very one that is about to fail.
-  const inUse = credentialId(env.DEEPSEEK_BASE_URL, lastPrimaryKey || (env.DEEPSEEK_API_KEY ?? ""));
+  // Exclude the credential the rotation just handed out, not a fixed one. With
+  // credentials rotating — and, with a second account, across endpoints too — a
+  // hardcoded exclusion would drop a healthy entry from the chain while leaving
+  // in the very one that is about to fail.
+  const inUse = lastPrimaryId || credentialId(env.DEEPSEEK_BASE_URL, env.DEEPSEEK_API_KEY ?? "");
 
   // Refused credentials are dropped for the same reason they are dropped from
   // the rotation: this chain is walked in order after a failure, so a dead entry

@@ -78,7 +78,7 @@ funded.
 
 Worth recording, because it changes how to read the "before" state: the
 previous `DEEPSEEK_API_KEY` was Groq key `gsk_rzptmY7…`, which is one of the
-seven keys returning `400 Organization has been restricted`. `primaryKeyPool()`
+seven keys returning `400 Organization has been restricted`. The primary pool
 matches every `LLM_PROVIDERS` entry sharing the primary base URL, so the primary
 rotation was dealing all eight Groq keys — seven of them banned. Roughly seven
 in eight primary model calls could not succeed, each paying a retry sequence
@@ -121,6 +121,48 @@ answer where it had produced zero, and correctly reported *"the research failed,
 not the documents"* — the distinction the design rests on. Three regression
 checks cover it in `scripts/deep-agents-test.ts`, at no branch cost, since the
 concurrency test has already spent both rounds by then.
+
+## A second account, and what it is actually worth
+
+Added 2026-09-13 (`ALIBABA2_*`). The motivation is concurrency: the free tier
+meters per account, so a research fan-out on one account queues behind one
+bucket no matter how many branches the supervisor opens.
+
+**A workspace key is scoped to its workspace.** `sk-ws-…` from account two sent
+to account one's endpoint returns `403 Workspace endpoint access denied` in
+~110 ms. The endpoint therefore has to travel with the key, which is why this is
+a second catalogue entry rather than another comma-separated value on
+`ALIBABA_API_KEY`. Both `ALIBABA2_API_KEY` and `ALIBABA2_BASE_URL` are required;
+an entry with no base URL is dropped rather than defaulted, since inheriting the
+primary's would 403 on every call and read as a dead provider.
+
+**The primary rotation had to be widened to allow it.** It was every entry
+sharing `DEEPSEEK_BASE_URL` — one endpoint by construction — so a second account
+could serve fallbacks and subagents but never the agent's own model, which is
+the busiest caller. It now deals `LlmProvider` entries, each carrying its own
+endpoint and tier models, and `PRIMARY_PROVIDER_ORDER` names which providers
+participate. Unset reproduces the old behaviour exactly.
+
+**Entitlement is per account and does not follow the catalogue.** `/models` on
+the new workspace lists the same 165 ids; a sweep of all 80 chat models found 78
+returning `403 AccessDenied.Unpurchased`, including `qwen3.8-max`, `qwen-flash`
+and every `qwen3.x`. Two answered:
+
+| Model | Result |
+| --- | --- |
+| `qwen-plus-character` | 200, 1.8 s, clean `tool_calls`, empty content |
+| `qwen-flash-character` | 200, 1.9 s, `tool_calls` valid but a ` ```json ` block of the same call is *also* emitted into content |
+
+Both are roleplay-tuned, so the account is wired into the failover and auxiliary
+chain only — where an extra live credential removes retries rather than choosing
+answers — and left out of `PRIMARY_PROVIDER_ORDER` and
+`SUBAGENT_PROVIDER_ORDER`. `rotation-proof` reports the reason plainly when the
+widened pool is forced: `quality invariant: NO — model varies`.
+
+The latency win is therefore mostly unrealised until the new workspace's key is
+granted the same model permissions as the primary. That is a console change, not
+a code one; after it, drop `ALIBABA2_MODEL_*` and add `alibaba2` to
+`PRIMARY_PROVIDER_ORDER` and `SUBAGENT_PROVIDER_ORDER`.
 
 ## Reproducing
 

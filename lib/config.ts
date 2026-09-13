@@ -69,6 +69,42 @@ const EnvSchema = z.object({
   ALIBABA_BASE_URL: z.string().optional(),
 
   /**
+   * A second Alibaba Model Studio account, as its own chain entry.
+   *
+   * Not a second key on the first entry, because a Model Studio workspace key
+   * (`sk-ws-…`) is scoped to the workspace that issued it: sending account two's
+   * key to account one's endpoint returns `403 Workspace endpoint access denied`
+   * in ~110 ms, measured. The endpoint must travel with the key, which means a
+   * separate entry rather than another comma-separated value.
+   *
+   * The point of it is concurrency, not redundancy. Free tiers meter per
+   * account, so a fan-out of research branches on one account queues behind one
+   * account's per-minute limit; a second account lets those branches actually
+   * run at the same time, which is where the wall-clock goes.
+   *
+   * Both must be set or the entry is dropped — a key without its endpoint would
+   * otherwise inherit the primary's and 403 on every call.
+   */
+  ALIBABA2_API_KEY: z.string().optional(),
+  ALIBABA2_BASE_URL: z.string().optional(),
+
+  /**
+   * Which providers the primary rotation itself draws from.
+   *
+   * Previously implicit: the primary pool was every chain entry sharing
+   * DEEPSEEK_BASE_URL, which can only ever be one endpoint. That is fine while
+   * extra capacity arrives as extra keys on the same account, and wrong as soon
+   * as it arrives as a second account — the new endpoint would serve fallbacks
+   * and subagents but never the agent's own model, which is the busiest caller.
+   *
+   * Named entries here rotate as peers on the main path, so list only providers
+   * whose PRO and FAST models you would accept on any request: the rotation is
+   * per model call, so anything listed answers a share of every turn. Unset
+   * keeps the old behaviour exactly.
+   */
+  PRIMARY_PROVIDER_ORDER: z.string().optional(),
+
+  /**
    * Which provider embeds documents and queries.
    *
    * Not a rotation and not a failover — a choice, fixed for the life of a
@@ -294,6 +330,18 @@ const PROVIDER_CATALOGUE: LlmProvider[] = [
     fast: process.env.ALIBABA_MODEL_FAST || MODEL_TIERS.FAST,
   },
   {
+    name: "alibaba2",
+    // Second Model Studio account. Carries its own endpoint because a workspace
+    // key is only valid against the workspace that issued it.
+    apiKey: env.ALIBABA2_API_KEY ?? "",
+    baseURL: env.ALIBABA2_BASE_URL ?? "",
+    // Defaults to the primary's model ids, which is right once the account is
+    // entitled to them. A workspace that only grants a subset must name it here:
+    // an unentitled model is a 403 per call, not a slower answer.
+    pro: process.env.ALIBABA2_MODEL_PRO || MODEL_TIERS.PRO,
+    fast: process.env.ALIBABA2_MODEL_FAST || MODEL_TIERS.FAST,
+  },
+  {
     name: "groq",
     apiKey: env.GROQ_API_KEY ?? "",
     baseURL: env.GROQ_BASE_URL,
@@ -453,7 +501,11 @@ export const LLM_PROVIDERS: LlmProvider[] = (() => {
   // another key at the same provider before leaving for a slower one — the
   // cheapest possible failover, and the one that matters most on the primary,
   // where free-tier per-key limits are what actually bite.
-  const usable = PROVIDER_CATALOGUE.flatMap((p) =>
+  //
+  // An entry with no base URL is dropped rather than defaulted: a key whose
+  // endpoint was forgotten would inherit someone else's and 403 on every call,
+  // which reads as a dead provider instead of a missing setting.
+  const usable = PROVIDER_CATALOGUE.filter((p) => p.baseURL).flatMap((p) =>
     splitKeys(p.apiKey).map((apiKey) => ({ ...p, apiKey })),
   );
 
@@ -473,6 +525,31 @@ export const LLM_PROVIDERS: LlmProvider[] = (() => {
     seen.add(identity);
     return true;
   });
+})();
+
+/**
+ * The pool the primary rotation deals from, in order.
+ *
+ * Defaults to every entry sharing the primary endpoint — that is, the several
+ * keys of one account — which is exactly what this was before it was named.
+ * PRIMARY_PROVIDER_ORDER widens it to several endpoints, which is the only way
+ * a second account can serve the agent's own model rather than just its
+ * fallbacks.
+ *
+ * Falls back to the implicit pool when the setting names nothing that exists,
+ * so a typo degrades to today's behaviour instead of leaving the agent with no
+ * primary at all.
+ */
+export const PRIMARY_PROVIDERS: LlmProvider[] = (() => {
+  const sameEndpoint = LLM_PROVIDERS.filter((p) => p.baseURL === env.DEEPSEEK_BASE_URL);
+
+  const requested = env.PRIMARY_PROVIDER_ORDER?.split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+  if (!requested?.length) return sameEndpoint;
+
+  const matched = requested.flatMap((name) => LLM_PROVIDERS.filter((p) => p.name === name));
+  return matched.length > 0 ? matched : sameEndpoint;
 })();
 
 /**
